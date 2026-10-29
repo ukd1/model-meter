@@ -9,7 +9,7 @@
 <main>
   <header class="masthead">
     <a class="wordmark" href="/" aria-label="Model Meter home"><span class="mark" aria-hidden="true">[m_]</span> MODEL METER<span class="version">/ 01</span></a>
-    <div class="connection"><span class="status-dot" id="statusDot"></span><span id="connectionState" role="status">LOCKED</span><button id="logout" class="quiet" hidden>Lock ↗</button></div>
+    <div class="connection"><span id="identityName" hidden></span><span class="status-dot" id="statusDot"></span><span id="connectionState" role="status">LOCKED</span><button id="logout" class="quiet" hidden>Lock ↗</button></div>
   </header>
   <section id="login" class="login-shell" hidden>
     <div class="eyebrow">PRIVATE ACCESS / AUTH REQUIRED</div>
@@ -25,7 +25,6 @@
   </section>
   <div id="message" class="notice" role="status" aria-live="polite" hidden></div>
   <div id="dashboard" hidden>
-    <div class="title-row"><div class="session"><span id="identityName">ADMINISTRATOR</span></div></div>
     <div class="navigation"><nav aria-label="Dashboard views"><button class="nav-button selected" data-view="overview" aria-pressed="true">01 / Overview</button><button class="nav-button" data-view="requests" aria-pressed="false">02 / Requests</button><button class="nav-button" data-view="access" aria-pressed="false">03 / Access</button></nav></div>
     <div class="filters" id="filters"><label>WINDOW<select id="period"><option value="0.016666666666666666">Last minute</option><option value="0.08333333333333333">Last 5 minutes</option><option value="0.25">Last 15 minutes</option><option value="1">Last hour</option><option value="4">Last 4 hours</option><option value="12">Last 12 hours</option><option value="24" selected>Last 24 hours</option><option value="168">Last 7 days</option><option value="720">Last 30 days</option><option value="0">All time</option></select></label><label id="userFilterLabel" hidden>USER<select id="userFilter"><option value="">All users</option></select></label><label>KEY<select id="keyFilter"><option value="">All keys</option></select></label><label class="model-filter">MODEL<input id="modelFilter" placeholder="All models · enter exact name"></label><button id="refresh" class="quiet resync" title="Resynchronize dashboard">↻ Sync</button></div>
     <section id="view-overview" class="view">

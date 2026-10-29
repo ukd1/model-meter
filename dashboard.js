@@ -15,6 +15,7 @@ function connection(state) {
 function lock(text = '') {
   auth = ''; identity = null; liveGeneration++; liveController?.abort(); refreshScheduled = false;
   $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
+  $('identityName').hidden = true; $('identityName').textContent = ''; $('identityName').title = '';
   $('newKey').textContent = ''; $('userToken').textContent = ''; $('adminToken').value = ''; $('currentPassword').value = ''; $('newPassword').value = '';
   $('secret').hidden = true; $('userSecret').hidden = true; renderCache.clear(); lastProfileName = undefined;
   for (const id of ['keyRows', 'userRows', 'usageRows', 'requestRows']) $(id).replaceChildren();
@@ -74,7 +75,8 @@ function renderUsers(users) {
   for (const id of ['usersPanel', 'userFilterLabel', 'keyOwnerLabel']) $(id).hidden = !identity.admin;
   $('profilePanel').hidden = !identity.id;
   $('passwordUsername').value = identity.username || '';
-  $('identityName').textContent = identity.id ? identity.name + (identity.admin ? ' / ADMINISTRATOR' : '') : 'ADMINISTRATOR';
+  $('identityName').textContent = identity.name || identity.username;
+  $('identityName').title = (identity.name || identity.username) + (identity.admin ? ' / Administrator' : '');
   if (identity.id && lastProfileName !== identity.name) { $('profileName').value = identity.name; lastProfileName = identity.name; }
   if (!identity.admin) return;
   selectOptions('userFilter', users, u => u.name, 'All users');
@@ -198,7 +200,7 @@ async function openDashboard(me) {
   const session = auth = Symbol('session'); identity = me;
   await refresh();
   if (auth !== session) return;
-  $('adminToken').value = ''; $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false;
+  $('adminToken').value = ''; $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false; $('identityName').hidden = false;
   switchView('overview'); startLive();
 }
 form('loginForm', async () => {
