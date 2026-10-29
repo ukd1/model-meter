@@ -133,7 +133,7 @@ async function refresh() {
       ]);
       if (auth !== session) return;
       identity = me; renderKeys(keys); renderUsers(users); renderUsage(usage); renderRequests(requests);
-      performanceData = series; chartSeries = series.series; renderCharts(); $('updated').textContent = 'SYNC / ' + new Date().toLocaleTimeString();
+      performanceData = series; chartSeries = series.series; renderCharts();
       if (status.dropped_records) message('Accounting gap: ' + status.dropped_records + ' records dropped since service start.');
     } while (pending && auth === session);
   } finally {
