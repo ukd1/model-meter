@@ -26,3 +26,12 @@ Inspected DS4's HTTP route dispatch and usage serializers. Added Anthropic Messa
 | `/v1/completions` | 36 / 4 | 36 / 4 | 1,432 / 1,273 ms |
 
 All eight inference records matched the upstream's usage after normalization. These durations include inference and are not proxy-overhead measurements. Test credentials were revoked; request metadata remains as verification history. The service is active on port 8001. This verifies Anthropic protocol compatibility with DS4, not a deployment against Anthropic's hosted service.
+
+## Live dashboard redesign — 2026-10-29
+
+- Replaced browser interval polling with an authenticated SSE change stream and event-triggered snapshots. Added a minimal green/violet terminal-style interface with Overview, Requests, and Access views; split embedded HTML/CSS/JavaScript into separate source files.
+- `go test -race ./...`, `go vet ./...`, build, and JavaScript syntax checks passed. New tests verify notification delivery after database commit, per-user notification scope, invalid authentication, live token-reset revocation, graceful stream closure, and nonblocking/coalesced slow-subscriber queues.
+- Playwright passed administrator/user sign-in, key/user creation, profile editing, graphs, mobile sizing, pushed request counters, external key renames, key revocation, and immediate active-session termination when the user is disabled.
+- The reconnect test took the browser offline, observed RECONNECTING, restored connectivity, and verified a new stream reached LIVE. An idle 16-second window spanning a keepalive produced zero dashboard data reads.
+- Isolated preview tests observed visible request updates in 119–183 ms. A browser check on the deployed port 8001 observed an update in 250 ms with zero dropped accounting records. These are observed dashboard-update timings, not inference benchmarks or latency guarantees.
+- Desktop/mobile screenshots inspected. Synthetic chart data was used only in the isolated preview database, not production. Deployed screenshot: `/tmp/model-meter-live-desktop.png`. Temporary test keys revoked and test accounts disabled.
