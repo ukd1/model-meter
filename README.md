@@ -49,3 +49,9 @@ journalctl --user -u model-meter
 The installed unit is in `~/.config/systemd/user/model-meter.service`; the repository copy is `deploy/model-meter.service`. Configuration: `LISTEN_ADDR`, `UPSTREAM_URL` (origin without `/v1`), `DATA_DIR`, and optional `UPSTREAM_API_KEY`. Service overrides can be placed in ignored `data/service.env` with mode 0600. Upstream credentials are not managed in the UI: its keys identify callers of this gateway.
 
 The local deployment uses HTTP, like the existing upstream. Use a trusted network or SSH tunnel (`ssh -L 8001:localhost:8001 <user>@<server>`) for access; terminate TLS before exposing it to an untrusted network. Forwarded IP headers are deliberately not trusted. No external frontend dependencies, fonts, or analytics are loaded.
+
+## Browser verification
+
+`tests/browser.cjs` exercises the deployed dashboard with Playwright. It creates a QA user/key, tests both roles, checks graphs and mobile sizing, then revokes the key and disables the user. It requires Node 20+ and Playwright with Chromium installed; supply `NODE_PATH` if Playwright is installed outside this repository. `TEST_URL` and `ADMIN_TOKEN_FILE` override its defaults. It writes screenshots under `/tmp`, without full credentials visible.
+
+Streaming usage follows the [OpenAI streaming event format](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events).
