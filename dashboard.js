@@ -3,9 +3,9 @@ const $ = id => document.getElementById(id);
 const number = v => v == null ? '—' : Number(v).toLocaleString();
 const duration = v => (v / 1000).toFixed(2) + ' s';
 const date = v => new Date(v).toLocaleString();
-let auth = '', identity = null, refreshing = false, pending = false, refreshTimer;
+let auth = '', identity = null, refreshing = false, pending = false, refreshScheduled = false;
 let liveController, liveGeneration = 0, currentView = 'overview', lastProfileName;
-let chartSeries = [], renderCache = new Map();
+let chartSeries = [], performanceData = null, renderCache = new Map();
 
 function message(text) { $('message').textContent = text; $('message').hidden = !text; }
 function connection(state) {
@@ -13,12 +13,12 @@ function connection(state) {
   $('statusDot').className = 'status-dot' + (state === 'live' ? ' live' : state === 'reconnecting' ? ' retry' : '');
 }
 function lock(text = '') {
-  auth = ''; identity = null; liveGeneration++; liveController?.abort(); clearTimeout(refreshTimer);
+  auth = ''; identity = null; liveGeneration++; liveController?.abort(); refreshScheduled = false;
   $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
   $('newKey').textContent = ''; $('userToken').textContent = ''; $('adminToken').value = '';
   $('secret').hidden = true; $('userSecret').hidden = true; renderCache.clear(); lastProfileName = undefined;
   for (const id of ['keyRows', 'userRows', 'usageRows', 'requestRows']) $(id).replaceChildren();
-  $('keyFilter').replaceChildren(new Option('All keys', '')); $('userFilter').replaceChildren(new Option('All users', '')); $('modelFilter').value = ''; chartSeries = [];
+  $('keyFilter').replaceChildren(new Option('All keys', '')); $('userFilter').replaceChildren(new Option('All users', '')); $('modelFilter').value = ''; chartSeries = []; performanceData = null;
   connection('locked'); message(text);
 }
 async function api(path, body) {
@@ -120,18 +120,19 @@ async function refresh() {
     do {
       pending = false; const q = query();
       const [me, keys, usage, requests, status, series, users] = await Promise.all([
-        api('me'), api('keys'), api('usage?' + q), api('requests?' + q), api('status'), api('timeseries?' + q), identity.admin ? api('users') : Promise.resolve([])
+        api('me'), api('keys'), api('usage?' + q), api('requests?' + q), api('status'), api('performance?' + q), identity.admin ? api('users') : Promise.resolve([])
       ]);
       if (auth !== session) return;
       identity = me; renderKeys(keys); renderUsers(users); renderUsage(usage); renderRequests(requests);
-      chartSeries = series; renderCharts(); $('updated').textContent = 'SYNC / ' + new Date().toLocaleTimeString();
+      performanceData = series; chartSeries = series.series; renderCharts(); $('updated').textContent = 'SYNC / ' + new Date().toLocaleTimeString();
       if (status.dropped_records) message('Accounting gap: ' + status.dropped_records + ' records dropped since service start.');
     } while (pending && auth === session);
   } finally { refreshing = false; }
 }
 function scheduleRefresh() {
-  clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => refresh().catch(e => message(e.message)), 100);
+  if (refreshScheduled) return;
+  refreshScheduled = true;
+  queueMicrotask(() => { refreshScheduled = false; refresh().catch(e => message(e.message)); });
 }
 
 // One authenticated fetch stream. Only changes trigger data reads; heartbeats
@@ -189,23 +190,88 @@ window.addEventListener('online', () => { if (auth) startLive(); });
 window.addEventListener('resize', () => { if (auth) requestAnimationFrame(renderCharts); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden && auth) scheduleRefresh(); });
 
-function renderCharts() { drawChart('requestChart', ['requests'], ['#b5ff55']); drawChart('tokenChart', ['input_tokens', 'output_tokens'], ['#b5ff55', '#b69aff']); }
-function drawChart(id, fields, colors) {
+function compact(value) {
+  if (value == null) return '—';
+  return new Intl.NumberFormat(undefined, {maximumFractionDigits: value < 10 ? 2 : 1, notation: value >= 10000 ? 'compact' : 'standard'}).format(value);
+}
+function windowLabel() { return $('period').selectedOptions[0].textContent; }
+function bucketLabel() {
+  const seconds = performanceData.bucket_seconds;
+  return seconds < 60 ? seconds + 's' : seconds < 3600 ? (seconds / 60) + 'm' : seconds < 86400 ? (seconds / 3600) + 'h' : (seconds / 86400) + 'd';
+}
+function renderCharts() {
+  if (!performanceData) return;
+  document.querySelectorAll('.window-caption').forEach(el => el.textContent = windowLabel() + ' / ' + bucketLabel() + ' buckets');
+  drawChart('requestChart', ['requests'], ['#b5ff55']);
+  drawChart('tokenChart', ['input_tokens', 'output_tokens'], ['#b5ff55', '#b69aff']);
+  drawChart('speedChart', ['output_tps'], ['#b69aff']);
+  drawHistogram('latencyHistogram', performanceData.latency, '#b5ff55', 's', 'latencySummary');
+  drawHistogram('speedHistogram', performanceData.output_rate, '#b69aff', 'tok/s', 'speedSummary');
+}
+function svgChart(id, height) {
   const NS = 'http://www.w3.org/2000/svg', svg = document.createElementNS(NS, 'svg');
-  const width = window.innerWidth <= 600 ? 360 : 600, right = width - 10;
-  svg.setAttribute('viewBox', '0 0 ' + width + ' 190'); svg.setAttribute('role', 'img'); svg.setAttribute('aria-label', id === 'requestChart' ? 'Requests per minute over the last hour' : 'Input and output tokens per minute over the last hour');
-  const now = Math.floor(Date.now() / 60000), byMinute = new Map(chartSeries.map(r => [Math.floor(Date.parse(r.time) / 60000), r]));
-  const bins = Array.from({length: 60}, (_, i) => byMinute.get(now - 59 + i) || {});
-  const largest = Math.max(0, ...bins.flatMap(b => fields.map(f => Number(b[f] || 0)))), max = Math.max(3, Math.ceil(largest / 3) * 3);
-  function el(tag, attrs, text) { const element = document.createElementNS(NS, tag); Object.entries(attrs).forEach(([key, value]) => element.setAttribute(key, value)); if (text) element.textContent = text; svg.append(element); return element; }
-  for (let i = 0; i < 4; i++) { const y = 14 + i * 46; el('line', {x1: 48, x2: right, y1: y, y2: y, stroke: '#253129', 'stroke-dasharray': '2 5'}); el('text', {x: 0, y: y + 4, fill: '#89968d', 'font-size': 10}, number(Math.round(max * (1 - i / 3)))); }
+  const width = window.innerWidth <= 600 ? 360 : 600;
+  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height); svg.setAttribute('role', 'img');
+  const labels = {requestChart: 'Requests per minute', tokenChart: 'Tokens per minute', speedChart: 'Mean end-to-end output tokens per second', latencyHistogram: 'Latency histogram', speedHistogram: 'End-to-end output speed histogram'};
+  svg.setAttribute('aria-label', labels[id] + ' / ' + windowLabel());
+  function el(tag, attrs, text) {
+    const element = document.createElementNS(NS, tag); Object.entries(attrs).forEach(([key, value]) => element.setAttribute(key, value));
+    if (text != null) element.textContent = text; svg.append(element); return element;
+  }
+  function title(element, text) { const t = document.createElementNS(NS, 'title'); t.textContent = text; element.append(t); }
+  return {svg, width, el, title};
+}
+function drawChart(id, fields, colors) {
+  const {svg, width, el, title} = svgChart(id, 190), right = width - 10, step = performanceData.bucket_seconds;
+  const first = Math.floor(Date.parse(performanceData.start) / 1000 / step) * step;
+  const last = Math.floor(Date.parse(performanceData.end) / 1000 / step) * step;
+  const byTime = new Map(chartSeries.map(r => [Date.parse(r.time) / 1000, r]));
+  const bins = Array.from({length: Math.max(1, Math.min(122, Math.round((last - first) / step) + 1))}, (_, i) => ({time: first + i * step, ...byTime.get(first + i * step)}));
+  const rate = id === 'speedChart';
+  const get = (bin, field) => rate ? (bin[field] ?? null) : (bin[field] || 0) * 60 / step;
+  const values = bins.flatMap(bin => fields.map(field => get(bin, field))).filter(v => v != null);
+  const largest = Math.max(0, ...values), max = largest > 0 ? largest * 1.1 : 1;
+  for (let i = 0; i < 4; i++) {
+    const y = 14 + i * 46;
+    el('line', {x1: 48, x2: right, y1: y, y2: y, stroke: '#253129', 'stroke-dasharray': '2 5'});
+    el('text', {x: 0, y: y + 4, fill: '#89968d', 'font-size': 10}, compact(max * (1 - i / 3)));
+  }
   fields.forEach((field, j) => {
-    const points = bins.map((bin, i) => [48 + i * (right - 48) / 59, 152 - (Number(bin[field] || 0) / max) * 138]);
-    if (j === 0) el('polygon', {points: '48,152 ' + points.map(p => p.join(',')).join(' ') + ' ' + right + ',152', fill: colors[j], opacity: .055});
-    el('polyline', {points: points.map(p => p.join(',')).join(' '), fill: 'none', stroke: colors[j], 'stroke-width': 2, 'stroke-linejoin': 'round'});
-    bins.forEach((bin, i) => { if (bin[field]) { const circle = el('circle', {cx: points[i][0], cy: points[i][1], r: 3, fill: colors[j]}); const title = document.createElementNS(NS, 'title'); title.textContent = date(bin.time) + ' / ' + field + ': ' + number(bin[field]); circle.append(title); } });
+    let path = '', open = false;
+    bins.forEach((bin, i) => {
+      const value = get(bin, field), x = 48 + i * (right - 48) / Math.max(1, bins.length - 1);
+      if (value == null) { open = false; return; }
+      const y = 152 - value / max * 138;
+      path += (open ? ' L ' : ' M ') + x + ',' + y; open = true;
+      if (value > 0 || rate) {
+        const circle = el('circle', {cx: x, cy: y, r: 3, fill: colors[j]});
+        const stamp = typeof bin.time === 'string' ? bin.time : bin.time * 1000;
+        title(circle, date(stamp) + ' / ' + compact(value) + (rate ? ' output tok/s / ' + bin.rate_samples + ' requests' : ' per minute / ' + bucketLabel() + ' bucket'));
+      }
+    });
+    el('path', {d: path, fill: 'none', stroke: colors[j], 'stroke-width': 2, 'stroke-linejoin': 'round'});
   });
-  if (!largest) el('text', {x: (48 + right) / 2, y: 83, fill: '#89968d', 'font-size': 11, 'text-anchor': 'middle'}, 'AWAITING SIGNAL');
-  el('text', {x: 48, y: 180, fill: '#89968d', 'font-size': 10}, '−60 MIN'); el('text', {x: right - 23, y: 180, fill: '#b5ff55', 'font-size': 10}, 'NOW');
+  if (!values.length || (!rate && !largest)) el('text', {x: (48 + right) / 2, y: 83, fill: '#89968d', 'font-size': 11, 'text-anchor': 'middle'}, 'NO SAMPLES IN WINDOW');
+  const startDate = new Date(performanceData.start), endDate = new Date(performanceData.end);
+  const format = date => (endDate - startDate) > 86400000 ? date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'}) : date.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit'});
+  el('text', {x: 48, y: 180, fill: '#89968d', 'font-size': 10}, format(startDate));
+  el('text', {x: right, y: 180, fill: '#b5ff55', 'font-size': 10, 'text-anchor': 'end'}, format(endDate));
   $(id).replaceChildren(svg);
+}
+function drawHistogram(id, distribution, color, unit, summaryID) {
+  const height = 280, {svg, width, el, title} = svgChart(id, height);
+  const left = 86, right = width - 40, max = Math.max(1, ...distribution.bins.map(b => b.count));
+  const rowHeight = 235 / distribution.bins.length;
+  distribution.bins.forEach((bin, i) => {
+    const y = 12 + i * rowHeight, label = bin.upper == null ? compact(bin.lower) + '+' : compact(bin.lower) + '–' + compact(bin.upper);
+    el('text', {x: left - 10, y: y + rowHeight * .55, 'text-anchor': 'end', fill: '#b7c6bb', 'font-size': 10}, label);
+    el('rect', {x: left, y, width: right - left, height: rowHeight - 5, fill: '#152019'});
+    const bar = el('rect', {x: left, y, width: bin.count / max * (right - left), height: rowHeight - 5, fill: color, opacity: .75, class: 'histogram-bar', tabindex: bin.count ? 0 : -1, 'aria-label': label + ' ' + unit + ': ' + bin.count + ' requests'});
+    title(bar, label + ' ' + unit + ' / ' + bin.count + ' requests / ' + (distribution.samples ? (100 * bin.count / distribution.samples).toFixed(1) : 0) + '%');
+    el('text', {x: right + 7, y: y + rowHeight * .55, fill: '#89968d', 'font-size': 10}, compact(bin.count));
+  });
+  el('text', {x: left, y: 270, fill: '#89968d', 'font-size': 10}, 'REQUEST COUNT →');
+  el('text', {x: 8, y: 270, fill: color, 'font-size': 10}, unit.toUpperCase());
+  $(id).replaceChildren(svg);
+  $(summaryID).textContent = number(distribution.samples) + ' samples / p50 ' + compact(distribution.p50) + ' ' + unit + ' / p95 ' + compact(distribution.p95) + ' ' + unit;
 }

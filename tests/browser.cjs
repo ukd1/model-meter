@@ -17,7 +17,7 @@ const fs=require('node:fs');
   await page.goto(base);await login(admin);await view('access');
   await page.locator('#userName').fill('Browser QA '+tag);await page.locator('#userForm button').click();await page.locator('#userSecret').waitFor({state:'visible'});const userToken=await page.locator('#userToken').textContent();await page.locator('#dismissUser').click();
   userID=(await adminAPI('users')).find(u=>u.name==='Browser QA '+tag).id;
-  await view('overview');if(await page.locator('.charts svg').count()!==2)throw Error('charts missing');await page.screenshot({path:'/tmp/model-meter-desktop.png',fullPage:true});
+  await view('overview');if(await page.locator('#view-overview svg').count()!==5)throw Error('charts missing');await page.screenshot({path:'/tmp/model-meter-desktop.png',fullPage:true});
   await page.locator('#logout').click();await login(userToken);await view('access');if(await page.locator('#usersPanel').isVisible())throw Error('user management visible to regular user');
   await page.locator('#keyName').fill('Browser QA key '+tag);await page.locator('#createForm button').click();await page.locator('#secret').waitFor({state:'visible'});const key=await page.locator('#newKey').textContent();await page.locator('#dismiss').click();keyID=(await adminAPI('keys')).find(k=>k.name==='Browser QA key '+tag).id;
   await page.locator('#profileName').fill('Browser QA renamed '+tag);await page.locator('#profileForm button').click();await page.waitForFunction(()=>document.getElementById('message').textContent==='Profile saved.');

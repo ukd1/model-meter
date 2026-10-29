@@ -236,6 +236,9 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		a.notifyKeys(v.ID)
 		reply(w, 200, map[string]bool{"ok": true})
+	case r.URL.Path == "/admin/performance" && r.Method == "GET":
+		where, args := scopedFilters()
+		a.performance(w, r, where, args)
 	case r.URL.Path == "/admin/timeseries" && r.Method == "GET":
 		where, args := scopedFilters()
 		a.query(w, `SELECT strftime('%Y-%m-%dT%H:%M:00Z',r.time) AS time,count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens,round(avg(duration_ms)) AS avg_ms FROM requests r JOIN keys k ON k.id=r.key_id WHERE julianday(r.time)>=julianday('now','-1 hour') AND `+where+` GROUP BY 1 ORDER BY 1`, args...)
@@ -695,8 +698,6 @@ func (a *App) startLogger() {
 	a.loggerWG.Add(1)
 	go func() {
 		defer a.loggerWG.Done()
-		ticker := time.NewTicker(250 * time.Millisecond)
-		defer ticker.Stop()
 		batch := make([][]any, 0, 100)
 		flush := func() {
 			if len(batch) == 0 {
@@ -735,21 +736,24 @@ func (a *App) startLogger() {
 			}
 			batch = batch[:0]
 		}
-		for {
-			select {
-			case r, ok := <-a.records:
-				if !ok {
-					flush()
-					return
+		for first := range a.records {
+			batch = append(batch, first)
+			// Drain only work already queued. Never wait to fill a batch.
+		drain:
+			for len(batch) < 100 {
+				select {
+				case record, ok := <-a.records:
+					if !ok {
+						break drain
+					}
+					batch = append(batch, record)
+				default:
+					break drain
 				}
-				batch = append(batch, r)
-				if len(batch) >= 100 {
-					flush()
-				}
-			case <-ticker.C:
-				flush()
 			}
+			flush()
 		}
+
 	}()
 }
 func (a *App) stopLogger() { close(a.records); a.loggerWG.Wait() }
