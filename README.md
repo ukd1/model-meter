@@ -2,6 +2,14 @@
 
 Go gateway and dashboard for an OpenAI-compatible upstream. Both run on **port 8001**; the upstream defaults to **http://127.0.0.1:8000**. SQLite stores users, hashed credentials, and request metadata.
 
+## Install with an AI agent
+
+Give your agent this prompt:
+
+> Install https://github.com/ukd1/model-meter on this machine. Read and follow AGENTS.md in the repository. Use the existing OpenAI/Anthropic-compatible server at http://127.0.0.1:8000 as the upstream and run the proxy and dashboard on port 8001. Preserve any existing configuration and data. Verify authentication, streaming, usage accounting, and persistent service startup, then tell me the dashboard URL and where to find my administrator token.
+
+Adjust the upstream and port in the prompt for your machine. The [agent installation guide](AGENTS.md) includes prerequisites, service configuration, updates, and verification.
+
 ## Use
 
 Open `http://<server>:8001`. From the project directory, read the initial administrator sign-in token with:
