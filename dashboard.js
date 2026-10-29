@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 const number = v => v == null ? '—' : Number(v).toLocaleString();
 const duration = v => (v / 1000).toFixed(2) + ' s';
 const date = v => new Date(v).toLocaleString();
+const periodStorageKey = 'model-meter.period';
 let auth = '', identity = null, refreshing = false, pending = false, refreshScheduled = false;
 let liveController, liveGeneration = 0, currentView = 'overview', lastProfileName;
 let chartSeries = [], performanceData = null, renderCache = new Map();
@@ -236,8 +237,11 @@ $('logout').onclick = async () => {
   catch (e) { message(e.message); }
   finally { $('logout').disabled = false; }
 };
-$('refresh').onclick = () => { message(''); scheduleRefresh(); };
-['period', 'keyFilter', 'modelFilter', 'userFilter'].forEach(id => $(id).onchange = scheduleRefresh);
+$('period').onchange = () => {
+  try { localStorage.setItem(periodStorageKey, $('period').value); } catch (_) { /* Storage may be blocked. */ }
+  scheduleRefresh();
+};
+['keyFilter', 'modelFilter', 'userFilter'].forEach(id => $(id).onchange = scheduleRefresh);
 document.querySelectorAll('[data-view]').forEach(button => button.onclick = () => switchView(button.dataset.view));
 $('baseURL').textContent = location.origin + '/v1';
 window.addEventListener('offline', () => liveController?.abort());
@@ -331,4 +335,9 @@ function drawHistogram(id, distribution, color, unit, summaryID) {
   $(summaryID).textContent = number(distribution.samples) + ' samples / p50 ' + compact(distribution.p50) + ' ' + unit + ' / p95 ' + compact(distribution.p95) + ' ' + unit;
 }
 
+// Restore only a supported window, before the first dashboard request.
+try {
+  const savedPeriod = localStorage.getItem(periodStorageKey);
+  if ([...$('period').options].some(option => option.value === savedPeriod)) $('period').value = savedPeriod;
+} catch (_) { /* Keep the default window when storage is unavailable. */ }
 restoreSession();
