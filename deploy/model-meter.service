@@ -6,8 +6,8 @@ After=network.target
 Type=simple
 WorkingDirectory=%h/model-meter
 ExecStart=%h/model-meter/model-meter
-Environment=LISTEN_ADDR=:8001
-Environment=UPSTREAM_URL=http://127.0.0.1:8000
+Environment=LISTEN_ADDR=:8000
+Environment=UPSTREAM_URL=http://127.0.0.1:8001
 Environment=DATA_DIR=%h/model-meter/data
 EnvironmentFile=-%h/model-meter/data/service.env
 Restart=on-failure

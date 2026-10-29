@@ -1,7 +1,7 @@
 // Requires Node 20+, Playwright and Chromium. Uses a temporary QA user/key.
 const {chromium,request}=require('playwright');
 (async()=>{
- const base=process.env.TEST_URL||'http://127.0.0.1:8001';
+ const base=process.env.TEST_URL||'http://127.0.0.1:8000';
  const admin=process.env.ADMIN_PASSWORD;const adminUsername=process.env.ADMIN_USERNAME||'admin';if(!admin)throw Error('ADMIN_PASSWORD required');
  const browser=await chromium.launch({headless:true,args:['--no-sandbox']});
  const adminContext=await request.newContext();

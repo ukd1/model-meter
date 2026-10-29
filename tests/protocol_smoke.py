@@ -1,6 +1,6 @@
 """Verify supported chat protocols against a running proxy, without saving bodies.
 
-TEST_URL defaults to http://127.0.0.1:8001; set ADMIN_USERNAME and ADMIN_PASSWORD. Creates and always revokes one temporary client key.
+TEST_URL defaults to http://127.0.0.1:8000; set ADMIN_USERNAME and ADMIN_PASSWORD. Creates and always revokes one temporary client key.
 """
 import json
 import os
@@ -8,7 +8,7 @@ import http.cookiejar
 import time
 import urllib.request
 
-base = os.environ.get("TEST_URL", "http://127.0.0.1:8001").rstrip("/")
+base = os.environ.get("TEST_URL", "http://127.0.0.1:8000").rstrip("/")
 admin_client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 

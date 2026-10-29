@@ -36,14 +36,18 @@ var dashboardJS []byte
 var dashboardCSS []byte
 
 type App struct {
-	db          *sql.DB
-	upstream    string
-	upstreamKey string
-	client      *http.Client
-	records     chan []any
-	loggerWG    sync.WaitGroup
-	dropped     atomic.Uint64
-	live        liveHub
+	db             *sql.DB
+	upstream       string
+	upstreamKey    string
+	client         *http.Client
+	records        chan []any
+	loggerWG       sync.WaitGroup
+	dropped        atomic.Uint64
+	live           liveHub
+	allowAnonymous atomic.Bool
+	settingsOnce   sync.Once
+	settingsErr    error
+	settingsMu     sync.Mutex
 }
 
 func token() string {
@@ -68,7 +72,8 @@ func openDB(path string) (*sql.DB, error) {
 	db.SetMaxOpenConns(8)
 	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,admin INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,prefix TEXT NOT NULL,created TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,key_id INTEGER NOT NULL REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,key_id INTEGER REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY,value INTEGER NOT NULL CHECK(value IN (0,1)));
  CREATE TABLE IF NOT EXISTS sessions(hash TEXT PRIMARY KEY,credential_hash TEXT NOT NULL,expires INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);
  CREATE INDEX IF NOT EXISTS requests_time ON requests(time); CREATE INDEX IF NOT EXISTS requests_key ON requests(key_id);`)
@@ -100,6 +105,10 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, e
 	}
+	if e = migrateAnonymousRequests(db); e != nil {
+		db.Close()
+		return nil, e
+	}
 	return db, nil
 }
 func reply(w http.ResponseWriter, status int, v any) {
@@ -111,6 +120,10 @@ func fail(w http.ResponseWriter, status int, msg string) {
 	reply(w, status, map[string]any{"error": map[string]string{"message": msg, "type": "proxy_error"}})
 }
 func (a *App) handler() http.Handler {
+	if err := a.loadSettings(); err != nil {
+		log.Print("proxy settings unavailable")
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fail(w, 503, "proxy settings unavailable") })
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/", a.proxy)
 	mux.HandleFunc("GET /dashboard.js", func(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +179,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		where, args := filters(r)
 		return where + " AND " + scope, append(args, scopeArgs...)
 	}
-	if strings.HasPrefix(r.URL.Path, "/admin/users") && !admin {
+	if (strings.HasPrefix(r.URL.Path, "/admin/users") || r.URL.Path == "/admin/settings") && !admin {
 		fail(w, 403, "administrator access required")
 		return
 	}
@@ -176,6 +189,8 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == "/admin/settings" && (r.Method == "GET" || r.Method == "POST"):
+		a.proxySettings(w, r)
 	case r.URL.Path == "/admin/events" && r.Method == "GET":
 		a.liveEvents(w, r, userID, admin)
 	case r.URL.Path == "/admin/me" && r.Method == "GET":
@@ -320,7 +335,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		a.performance(w, r, where, args)
 	case r.URL.Path == "/admin/timeseries" && r.Method == "GET":
 		where, args := scopedFilters()
-		a.query(w, `SELECT strftime('%Y-%m-%dT%H:%M:00Z',r.time) AS time,count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens,round(avg(duration_ms)) AS avg_ms FROM requests r JOIN keys k ON k.id=r.key_id WHERE julianday(r.time)>=julianday('now','-1 hour') AND `+where+` GROUP BY 1 ORDER BY 1`, args...)
+		a.query(w, `SELECT strftime('%Y-%m-%dT%H:%M:00Z',r.time) AS time,count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens,round(avg(duration_ms)) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE julianday(r.time)>=julianday('now','-1 hour') AND `+where+` GROUP BY 1 ORDER BY 1`, args...)
 	case r.URL.Path == "/admin/status" && r.Method == "GET":
 		reply(w, 200, map[string]any{"dropped_records": a.dropped.Load(), "queued_records": len(a.records)})
 	case r.URL.Path == "/admin/keys" && r.Method == "GET":
@@ -375,10 +390,10 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		reply(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/admin/usage" && r.Method == "GET":
 		where, args := scopedFilters()
-		a.query(w, `SELECT k.id AS key_id,k.name,k.user_id,(SELECT name FROM users WHERE id=k.user_id) AS user_name,r.model,count(*) AS requests,sum(CASE WHEN r.status>=400 OR r.outcome!='complete' THEN 1 ELSE 0 END) AS errors,sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.cached_tokens) AS cached_tokens,sum(CASE WHEN r.input_tokens IS NULL THEN 1 ELSE 0 END) AS unmetered,round(avg(r.duration_ms)) AS avg_ms FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where+` GROUP BY k.id,r.model ORDER BY requests DESC`, args...)
+		a.query(w, `SELECT k.id AS key_id,coalesce(k.name,'Anonymous') AS name,k.user_id,(SELECT name FROM users WHERE id=k.user_id) AS user_name,r.model,count(*) AS requests,sum(CASE WHEN r.status>=400 OR r.outcome!='complete' THEN 1 ELSE 0 END) AS errors,sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.cached_tokens) AS cached_tokens,sum(CASE WHEN r.input_tokens IS NULL THEN 1 ELSE 0 END) AS unmetered,round(avg(r.duration_ms)) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` GROUP BY k.id,r.model ORDER BY requests DESC`, args...)
 	case r.URL.Path == "/admin/requests" && r.Method == "GET":
 		where, args := scopedFilters()
-		a.query(w, `SELECT r.*,k.name AS key_name FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY r.id DESC LIMIT 200`, args...)
+		a.query(w, `SELECT r.*,coalesce(k.name,'Anonymous') AS key_name FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY r.id DESC LIMIT 200`, args...)
 	default:
 		http.NotFound(w, r)
 	}
@@ -388,6 +403,10 @@ func filters(r *http.Request) (string, []any) {
 	args := []any{}
 	for _, v := range []struct{ param, col string }{{"key", "r.key_id"}, {"model", "r.model"}, {"user", "k.user_id"}} {
 		if x := r.URL.Query().Get(v.param); x != "" {
+			if v.param == "key" && x == "anonymous" {
+				s += " AND r.key_id IS NULL"
+				continue
+			}
 			s += " AND " + v.col + "=?"
 			args = append(args, x)
 		}
@@ -537,6 +556,9 @@ func (m *Meter) parseEnvelope(b []byte, depth int) {
 
 // Accept SDK-standard authentication without forwarding the caller's key.
 func proxyCredential(r *http.Request) string {
+	if len(r.Header.Values("Authorization")) > 1 || len(r.Header.Values("X-Api-Key")) > 1 {
+		return ""
+	}
 	bearer := ""
 	auth := r.Header.Get("Authorization")
 	if strings.HasPrefix(auth, "Bearer ") {
@@ -607,10 +629,16 @@ func (m *Meter) finish() {
 	}
 }
 func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
-	var id int64
-	if a.db.QueryRow(`SELECT k.id FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.user_id IS NULL OR u.disabled=0)`, hash(proxyCredential(r))).Scan(&id) != nil {
-		fail(w, 401, "valid proxy key required")
-		return
+	var keyID any
+	missingCredential := len(r.Header.Values("Authorization")) == 0 && len(r.Header.Values("X-Api-Key")) == 0
+	if !missingCredential || !a.allowAnonymous.Load() {
+		var id int64
+		credential := proxyCredential(r)
+		if credential == "" || a.db.QueryRow(`SELECT k.id FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.user_id IS NULL OR u.disabled=0)`, hash(credential)).Scan(&id) != nil {
+			fail(w, 401, "valid proxy key required")
+			return
+		}
+		keyID = id
 	}
 	start := time.Now()
 	status := 502
@@ -620,7 +648,7 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	// Store only a known route label, never query parameters or arbitrary URL content.
 	path, method := proxyRoute(r.URL.Path)
 	defer func() {
-		record := []any{id, start.UTC().Format(time.RFC3339Nano), m.Model, r.Method, path, source, status, time.Since(start).Milliseconds(), m.Input, m.Output, m.Cached, outcome}
+		record := []any{keyID, start.UTC().Format(time.RFC3339Nano), m.Model, r.Method, path, source, status, time.Since(start).Milliseconds(), m.Input, m.Output, m.Cached, outcome}
 		select {
 		case a.records <- record:
 		default:
@@ -749,7 +777,7 @@ func main() {
 	if e = bootstrapAdmin(db); e != nil {
 		log.Fatal(e)
 	}
-	up := strings.TrimRight(env("UPSTREAM_URL", "http://127.0.0.1:8000"), "/")
+	up := strings.TrimRight(env("UPSTREAM_URL", "http://127.0.0.1:8001"), "/")
 	u, e := url.Parse(up)
 	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		log.Fatal("invalid upstream URL")
@@ -757,7 +785,7 @@ func main() {
 	a := &App{db: db, upstream: up, upstreamKey: os.Getenv("UPSTREAM_API_KEY"), client: &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
 	a.startLogger()
 	defer a.stopLogger()
-	srv := &http.Server{Addr: env("LISTEN_ADDR", ":8001"), Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	srv := &http.Server{Addr: env("LISTEN_ADDR", ":8000"), Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	go func() {
 		log.Printf("Model Meter listening on %s", srv.Addr)
 		if e := srv.ListenAndServe(); e != nil && e != http.ErrServerClosed {

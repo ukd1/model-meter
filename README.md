@@ -1,18 +1,18 @@
 # Model Meter
 
-Go gateway and dashboard for an OpenAI/Anthropic-compatible upstream. Both run on **port 8001**; the upstream defaults to **http://127.0.0.1:8000**. SQLite stores users, hashed credentials, and request metadata.
+Go gateway and dashboard for an OpenAI/Anthropic-compatible upstream. Both run on **port 8000**; the upstream defaults to **http://127.0.0.1:8001**. Bind the upstream to loopback so clients reach it through the gateway. SQLite stores users, hashed credentials, and request metadata.
 
 ## Install with an AI agent
 
 Give your agent this prompt:
 
-> Install https://github.com/ukd1/model-meter on this machine. Read and follow AGENTS.md in the repository. Use the existing OpenAI/Anthropic-compatible server at http://127.0.0.1:8000 as the upstream and run the proxy and dashboard on port 8001. Preserve any existing configuration and data. Verify authentication, streaming, usage accounting, and persistent service startup, then tell me the dashboard URL and how to retrieve the initial administrator username and password.
+> Install https://github.com/ukd1/model-meter on this machine. Read and follow AGENTS.md in the repository. Use the existing OpenAI/Anthropic-compatible server at http://127.0.0.1:8001 as the upstream and run the proxy and dashboard on port 8000. Preserve any existing configuration and data. Verify authentication, streaming, usage accounting, and persistent service startup, then tell me the dashboard URL and how to retrieve the initial administrator username and password.
 
 Adjust the upstream and port in the prompt for your machine. The [agent installation guide](AGENTS.md) includes prerequisites, service configuration, updates, and verification.
 
 ## Use
 
-Open `http://<server>:8001` and sign in with your username and password. On initial setup, the service creates an administrator account and prints its generated password once to its startup console (the service journal under systemd). Save it in your password manager. Passwords are stored as salted hashes; there is no master administrator token.
+Open `http://<server>:8000` and sign in with your username and password. On initial setup, the service creates an administrator account and prints its generated password once to its startup console (the service journal under systemd). Save it in your password manager. Passwords are stored as salted hashes; there is no master administrator token.
 
 Administrators create named accounts with the User or Administrator role in **Access → Users**. Each new account receives a generated password shown once. Users manage their own API keys, profile, and usage. Administrators manage all accounts, keys, and aggregate usage, and can promote or demote accounts with **Make administrator / Make user**. Each administrator signs in under their own username. Disabling an account also blocks its API keys. Existing API keys and usage history are preserved when changing account roles or passwords.
 
@@ -25,13 +25,21 @@ When upgrading from token sign-in, existing accounts, API keys, and usage histor
 Configure your OpenAI-compatible client:
 
 ```sh
-export OPENAI_BASE_URL=http://<server>:8001/v1
+export OPENAI_BASE_URL=http://<server>:8000/v1
 export OPENAI_API_KEY=mm_<key-created-in-dashboard>
 curl "$OPENAI_BASE_URL/chat/completions" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
+
+## Anonymous API access
+
+Administrators can enable **Access → Anonymous API access** to allow `/v1` requests without a key. It is disabled by default, and the setting survives service restarts. Use **Disable** to require keys again for new requests. Dashboard access always requires an account.
+
+With this mode enabled, omit both `Authorization` and `x-api-key`. Supplied credentials are still validated: invalid, revoked, disabled-account, malformed, or conflicting keys are rejected rather than treated as anonymous. Clients that insist on sending an API key should use a valid dashboard-issued key.
+
+Anonymous requests use the same asynchronous metadata and token accounting as keyed requests. Administrators see them as **Anonymous** in request history, aggregate usage, and charts; select **Anonymous (no key)** in the key filter to see only that traffic. Ordinary users continue to see only their own keyed traffic. Anonymous history remains available after the mode is disabled; no account or synthetic key is created for it.
 
 ## API compatibility
 
@@ -47,10 +55,10 @@ curl "$OPENAI_BASE_URL/chat/completions" \
 
 These cover DS4's model and inference routes. Upstream support determines which routes work; the gateway forwards each protocol without converting it to another API. DS4 does not expose embeddings, Anthropic token counting, or stored Responses retrieval/deletion in the inspected route table, so those are not claimed as DS4 features. The gateway does not implement token counting or stored-response routes.
 
-OpenAI clients use base URL `http://<server>:8001/v1`. Anthropic clients use base URL `http://<server>:8001` and the same dashboard-issued client keys via `x-api-key` or `Authorization: Bearer`. Conflicting credentials are rejected. Example:
+OpenAI clients use base URL `http://<server>:8000/v1`. Anthropic clients use base URL `http://<server>:8000` and the same dashboard-issued client keys via `x-api-key` or `Authorization: Bearer`. Conflicting credentials are rejected. Example:
 
 ```sh
-export ANTHROPIC_BASE_URL=http://<server>:8001
+export ANTHROPIC_BASE_URL=http://<server>:8000
 export ANTHROPIC_API_KEY=mm_<key-created-in-dashboard>
 curl "$ANTHROPIC_BASE_URL/v1/messages" \
   -H "x-api-key: $ANTHROPIC_API_KEY" \
@@ -69,9 +77,9 @@ Persisted request fields: key ID, UTC start time, model, method, known endpoint 
 
 Completed metadata enters a bounded **8192-record queue without waiting**. A background writer commits immediately when records arrive, draining up to 100 records already queued into each transaction. It never waits for a timer or a full batch. WAL with a connection pool lets authentication reads run alongside accounting writes. Graceful shutdown drains handlers and the queue. Crashes can lose queued records; a full queue or failed transaction drops accounting records instead of blocking responses. The dashboard warns about dropped records, and `/admin/status` exposes `dropped_records` and `queued_records` (dropped count resets on restart). This is usage monitoring, not billing-grade accounting.
 
-Totals use upstream-reported usage. Missing usage is NULL and shown as unmetered, never estimated. Interrupted streams may lack final usage. Cached tokens are included in input totals. Metadata persists indefinitely; back up SQLite with its backup API or while the service is stopped. The live charts cover the selected window (last 1, 5, or 15 minutes; 1, 4, 12, or 24 hours; 7 or 30 days; or all time) and honor user/key/model filters. Time-bucket sizes adapt to keep roughly 120 points or fewer. Completed accounting batches and account/key changes trigger live updates through an authenticated Server-Sent Events connection; the browser does not poll for data. Recent requests are limited to the latest 200; aggregates cover all matching history.
+Totals use upstream-reported usage. Missing usage is NULL and shown as unmetered, never estimated. Interrupted streams may lack final usage. Cached tokens are included in input totals. Metadata persists indefinitely; back up SQLite with its backup API or while the service is stopped. The live charts cover the selected window (last 1, 5, or 15 minutes; 1, 4, 12, or 24 hours; 7 or 30 days; or all time) and honor user/key/model filters. Time-bucket sizes adapt to keep roughly 120 points or fewer. Completed accounting batches and account/key/settings changes trigger live updates through an authenticated Server-Sent Events connection; the browser does not poll for data. Recent requests are limited to the latest 200; aggregates cover all matching history.
 
-Request bodies are limited to 32 MiB; metering inspection buffers are limited to 8 MiB per JSON response/SSE line. Oversized or unrecognized usage envelopes are unmetered. Requests have a 30-minute upstream deadline. The service records authenticated requests; rejected authentication is not attributed to a key. Existing in-flight requests can finish after a key is revoked.
+Request bodies are limited to 32 MiB; metering inspection buffers are limited to 8 MiB per JSON response/SSE line. Oversized or unrecognized usage envelopes are unmetered. Requests have a 30-minute upstream deadline. The service records authenticated requests and, when enabled, anonymous requests with no key ID; rejected authentication is not recorded as anonymous traffic. Existing in-flight requests can finish after a key is revoked.
 
 ## Operate
 
@@ -98,13 +106,13 @@ systemctl --user enable --now model-meter
 
 The installed unit is in `~/.config/systemd/user/model-meter.service`; the repository copy is `deploy/model-meter.service`. Configuration: `LISTEN_ADDR`, `UPSTREAM_URL` (origin without `/v1`), `DATA_DIR`, and optional `UPSTREAM_API_KEY`. Service overrides can be placed in ignored `data/service.env` with mode 0600. Upstream credentials are not managed in the UI: its keys identify callers of this gateway.
 
-The local deployment uses HTTP, like the existing upstream. Use a trusted network or SSH tunnel (`ssh -L 8001:localhost:8001 <user>@<server>`) for access; terminate TLS before exposing it to an untrusted network. Forwarded IP headers are deliberately not trusted. No external frontend dependencies, fonts, or analytics are loaded.
+The local deployment uses HTTP, like the existing upstream. Use a trusted network or SSH tunnel (`ssh -L 8000:localhost:8000 <user>@<server>`) for access; terminate TLS before exposing it to an untrusted network. Forwarded IP headers are deliberately not trusted. No external frontend dependencies, fonts, or analytics are loaded.
 
 ## Live dashboard
 
 The interface separates Overview, Requests, and Access. It uses local fonts, a minimal terminal-inspired green/violet palette, and reduced-motion-aware effects; all frontend assets are embedded in the Go binary.
 
-`GET /admin/events` opens an authenticated SSE stream. The browser authenticates with its HttpOnly session cookie, never a credential in the URL or browser storage. Administrative clients first send JSON `{ "username": "…", "password": "…" }` to `POST /auth/login` with `X-Model-Meter: dashboard` and retain the returned session cookie. Dashboard routes do not accept a master token or client API key. Cookie-authenticated dashboard changes require the dashboard request header and same-origin requests. On a committed usage batch or account/key change, the server sends a notification and the browser immediately reloads its authorized view, with no fixed browser debounce. Overlapping refreshes are coalesced. Changes are coalesced into a bounded one-slot notification queue per connection. A slow dashboard cannot block accounting writes or inference responses.
+`GET /admin/events` opens an authenticated SSE stream. The browser authenticates with its HttpOnly session cookie, never a credential in the URL or browser storage. Administrative clients first send JSON `{ "username": "…", "password": "…" }` to `POST /auth/login` with `X-Model-Meter: dashboard` and retain the returned session cookie. Dashboard routes do not accept a master token or client API key. Cookie-authenticated dashboard changes require the dashboard request header and same-origin requests. On a committed usage batch or account/key/settings change, the server sends a notification and the browser immediately reloads its authorized view, with no fixed browser debounce. Overlapping refreshes are coalesced. Changes are coalesced into a bounded one-slot notification queue per connection. A slow dashboard cannot block accounting writes or inference responses.
 
 Users receive notifications only for their own activity; administrators receive all activity. User access is revalidated before notifications and 15-second keepalive heartbeats. Disabling a user or resetting their password closes their live session. Network interruptions trigger reconnect with backoff and a fresh snapshot to recover missed changes. Heartbeats keep the stream alive; they do not trigger periodic data fetches. Aggregate totals reflect the last snapshot; filter changes also fetch a fresh view. The selected time window is remembered in this browser across page refreshes when browser storage is available. Usage appears when a request finishes and its metadata batch commits, not token by token during inference.
 

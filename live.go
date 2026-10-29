@@ -67,6 +67,19 @@ func (a *App) notifyKeys(ids ...any) {
 	if len(ids) == 0 {
 		return
 	}
+	// Anonymous records have no owner. Wake administrators without exposing
+	// their activity to regular users or inventing a proxy key.
+	keys := make([]any, 0, len(ids))
+	for _, id := range ids {
+		if id != nil {
+			keys = append(keys, id)
+		}
+	}
+	if len(keys) == 0 {
+		a.live.notify(nil)
+		return
+	}
+	ids = keys
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
 	rows, e := a.db.Query(`SELECT DISTINCT user_id FROM keys WHERE id IN (`+placeholders+`)`, ids...)
 	if e != nil {

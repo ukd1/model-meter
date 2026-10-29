@@ -3,6 +3,7 @@
 @media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
 
 .metric-note{font-size:10px;color:var(--muted);line-height:1.7;margin-top:18px}.distribution-note{margin:-5px 0 24px}.histogram svg{width:100%;display:block}.histogram-bar:hover,.histogram-bar:focus{opacity:1;outline:1px solid currentColor}.distribution-summary{font-size:10px;color:var(--muted);padding-top:14px;border-top:1px solid var(--line);line-height:1.8}#speedChart{max-width:900px;margin:auto}
+.access-setting{display:flex;align-items:center;justify-content:space-between;gap:18px}.access-setting h2{display:flex;align-items:center;gap:14px;flex-wrap:wrap}.access-setting p{color:var(--muted);font-size:11px;margin-top:8px}.access-setting button{flex-shrink:0}
 
 @media(max-width:900px){.brand-name,.version{display:none}.navigation{margin-left:0}nav{gap:16px}#identityName{max-width:90px}}
 @media(max-width:600px){.masthead{gap:8px}.wordmark{gap:0}.mark{font-size:22px;margin-right:0}.nav-prefix{display:none}nav{gap:10px}.nav-button{font-size:10px}.connection{gap:5px;flex-shrink:0}.connection button{padding:5px;margin-left:0}#identityName{max-width:50px;margin-right:0}#connectionState{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}}

@@ -7,6 +7,7 @@ const periodStorageKey = 'model-meter.period';
 let auth = '', identity = null, refreshing = false, pending = false, refreshScheduled = false;
 let liveController, liveGeneration = 0, currentView = 'overview', lastProfileName;
 let chartSeries = [], performanceData = null, renderCache = new Map();
+let settings = null;
 
 function message(text) { $('message').textContent = text; $('message').hidden = !text; }
 function connection(state) {
@@ -16,6 +17,7 @@ function connection(state) {
 }
 function lock(text = '') {
   auth = ''; identity = null; liveGeneration++; liveController?.abort(); refreshScheduled = false;
+  settings = null; $('anonymousPanel').hidden = true;
   $('navigation').hidden = true; $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
   $('identityName').hidden = true; $('identityName').textContent = ''; $('identityName').title = '';
   $('newKey').textContent = ''; $('userToken').textContent = ''; $('adminToken').value = ''; $('currentPassword').value = ''; $('newPassword').value = '';
@@ -62,7 +64,8 @@ function action(parent, label, handler, danger = false) {
 }
 function actions(tr) { const td = cell(tr, ''); const div = document.createElement('div'); div.className = 'actions'; td.append(div); return div; }
 function renderKeys(keys) {
-  selectOptions('keyFilter', keys, k => k.name + (k.revoked ? ' (revoked)' : ''), 'All keys');
+  const filterKeys = identity.admin ? [{id: 'anonymous', name: 'Anonymous (no key)'}, ...keys] : keys;
+  selectOptions('keyFilter', filterKeys, k => k.name + (k.revoked ? ' (revoked)' : ''), 'All keys');
   if (!changed('keyRows', keys)) return;
   keys.forEach(k => {
     const tr = row('keyRows', [k.name, k.prefix + '…', date(k.created)]); detail(tr.firstChild, k.user_name || 'Administrator');
@@ -72,6 +75,18 @@ function renderKeys(keys) {
     if (!k.revoked) action(target, 'Revoke', async () => { if (confirm('Revoke ' + k.name + '? New requests will be denied.')) await api('revoke', {id: k.id}); }, true);
   });
   empty('keyRows', 5, 'No keys yet. Create a key to connect your first client.');
+}
+function renderSettings(value) {
+  settings = value;
+  $('anonymousPanel').hidden = !identity.admin;
+  if (!identity.admin || !settings) return;
+  const enabled = settings.allow_anonymous;
+  $('anonymousStatus').textContent = enabled ? 'Enabled' : 'Disabled';
+  $('anonymousStatus').className = 'badge' + (enabled ? '' : ' off');
+  $('anonymousToggle').textContent = enabled ? 'Disable' : 'Enable';
+  $('anonymousToggle').className = enabled ? 'secondary' : '';
+  $('anonymousToggle').setAttribute('aria-label', (enabled ? 'Disable' : 'Enable') + ' anonymous API access');
+  $('anonymousToggle').setAttribute('aria-pressed', enabled);
 }
 function renderUsers(users) {
   for (const id of ['usersPanel', 'userFilterLabel', 'keyOwnerLabel']) $(id).hidden = !identity.admin;
@@ -102,7 +117,7 @@ function renderUsage(usage) {
   $('duration').textContent = totals.requests ? duration(totals.ms / totals.requests) : '—';
   $('errors').textContent = number(totals.errors) + ' failed / interrupted'; $('cached').textContent = number(totals.cached_tokens) + ' cached input'; $('unmetered').textContent = number(totals.unmetered) + ' unmetered requests';
   if (!changed('usageRows', usage)) return;
-  usage.forEach(u => { const tr = row('usageRows', [u.name, u.model || '—', number(u.requests), number(u.input_tokens), number(u.output_tokens), number(u.cached_tokens), number(u.unmetered), duration(u.avg_ms)]); detail(tr.firstChild, u.user_name || 'Administrator'); });
+  usage.forEach(u => { const tr = row('usageRows', [u.name, u.model || '—', number(u.requests), number(u.input_tokens), number(u.output_tokens), number(u.cached_tokens), number(u.unmetered), duration(u.avg_ms)]); detail(tr.firstChild, u.key_id === null ? 'No API key' : u.user_name || 'Administrator'); });
   empty('usageRows', 8);
 }
 function renderRequests(requests) {
@@ -132,11 +147,11 @@ async function refresh() {
         $('userToken').textContent = ''; $('userSecret').hidden = true; renderCache.clear();
       }
       const q = query();
-      const [keys, usage, requests, status, series, users] = await Promise.all([
-        api('keys'), api('usage?' + q), api('requests?' + q), api('status'), api('performance?' + q), me.admin ? api('users') : Promise.resolve([])
+      const [keys, usage, requests, status, series, users, currentSettings] = await Promise.all([
+        api('keys'), api('usage?' + q), api('requests?' + q), api('status'), api('performance?' + q), me.admin ? api('users') : Promise.resolve([]), me.admin ? api('settings') : Promise.resolve(null)
       ]);
       if (auth !== session) return;
-      identity = me; renderKeys(keys); renderUsers(users); renderUsage(usage); renderRequests(requests);
+      identity = me; renderKeys(keys); renderUsers(users); renderSettings(currentSettings); renderUsage(usage); renderRequests(requests);
       performanceData = series; chartSeries = series.series; renderCharts();
       if (status.dropped_records) message('Accounting gap: ' + status.dropped_records + ' records dropped since service start.');
     } while (pending && auth === session);
@@ -231,6 +246,17 @@ form('passwordForm', async () => {
 });
 $('dismiss').onclick = () => { $('newKey').textContent = ''; $('secret').hidden = true; };
 $('dismissUser').onclick = () => { $('userToken').textContent = ''; $('userSecret').hidden = true; };
+$('anonymousToggle').onclick = async () => {
+  if (!identity?.admin || !settings) return;
+  const button = $('anonymousToggle'), session = auth;
+  button.disabled = true; message('');
+  try {
+    const updated = await api('settings', {allow_anonymous: !settings.allow_anonymous});
+    if (auth !== session) return;
+    renderSettings(updated); await refresh();
+  } catch (e) { if (auth === session) message(e.message); }
+  finally { button.disabled = false; }
+};
 $('logout').onclick = async () => {
   $('logout').disabled = true;
   try { await sessionAction('logout', {}); lock(); }

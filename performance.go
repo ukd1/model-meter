@@ -52,7 +52,7 @@ func distributionFor(ctx context.Context, tx *sql.Tx, where string, args []any, 
 			d.Bins[i].Upper = &upper
 		}
 	}
-	base := `SELECT ` + metric + ` AS value FROM requests r JOIN keys k ON k.id=r.key_id WHERE ` + where + ` AND ` + inferenceSQL
+	base := `SELECT ` + metric + ` AS value FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE ` + where + ` AND ` + inferenceSQL
 	query := `WITH valueset AS (` + base + `), ranked AS (SELECT value,row_number() OVER (ORDER BY value) AS rn,count(*) OVER () AS total FROM valueset WHERE value IS NOT NULL AND value>=0) SELECT count(*),avg(value),max(CASE WHEN rn=(total+1)/2 THEN value END),max(CASE WHEN rn=(total*95+99)/100 THEN value END) FROM ranked`
 	if e := tx.QueryRowContext(ctx, query, args...).Scan(&d.Samples, &d.Mean, &d.P50, &d.P95); e != nil {
 		return d, e
@@ -107,7 +107,7 @@ func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, 
 	// All-time starts at the oldest matching record; an empty window defaults to 1h.
 	if r.URL.Query().Get("since") == "" {
 		var oldest sql.NullFloat64
-		e = tx.QueryRowContext(ctx, `SELECT min(unixepoch(r.time)) FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where, args...).Scan(&oldest)
+		e = tx.QueryRowContext(ctx, `SELECT min(unixepoch(r.time)) FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where, args...).Scan(&oldest)
 		if e != nil {
 			fail(w, 500, "database error")
 			return
@@ -132,7 +132,7 @@ func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, 
 		fail(w, 500, "database error")
 		return
 	}
-	query := fmt.Sprintf(`SELECT (unixepoch(r.time)/%d)*%d AS bucket,count(*),coalesce(sum(r.input_tokens),0),coalesce(sum(r.output_tokens),0),avg(%s),count(%s) FROM requests r JOIN keys k ON k.id=r.key_id WHERE %s GROUP BY bucket ORDER BY bucket`, stats.BucketSeconds, stats.BucketSeconds, rateSQL, rateSQL, where)
+	query := fmt.Sprintf(`SELECT (unixepoch(r.time)/%d)*%d AS bucket,count(*),coalesce(sum(r.input_tokens),0),coalesce(sum(r.output_tokens),0),avg(%s),count(%s) FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE %s GROUP BY bucket ORDER BY bucket`, stats.BucketSeconds, stats.BucketSeconds, rateSQL, rateSQL, where)
 	rows, e := tx.QueryContext(ctx, query, args...)
 	if e != nil {
 		fail(w, 500, "database error")
