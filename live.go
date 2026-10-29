@@ -83,9 +83,9 @@ func (a *App) notifyKeys(ids ...any) {
 	a.live.notify(owners)
 }
 
-// Auth remains in the Authorization header, never in a URL or browser storage.
-// Recheck user access before every change and heartbeat, including token resets.
-func (a *App) liveEvents(w http.ResponseWriter, r *http.Request, userID int64, admin bool, credential string) {
+// Recheck bearer or cookie access before every change and heartbeat, including
+// logout, expired sessions, user disabling, and password resets.
+func (a *App) liveEvents(w http.ResponseWriter, r *http.Request, userID int64, admin bool) {
 	sub, ok := a.live.subscribe(userID, admin)
 	if !ok {
 		fail(w, 503, "service stopping")
@@ -120,15 +120,12 @@ func (a *App) liveEvents(w http.ResponseWriter, r *http.Request, userID int64, a
 		case <-heartbeat.C:
 			event = "heartbeat"
 		}
-		if !admin {
-			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-			var valid int
-			e := a.db.QueryRowContext(ctx, `SELECT 1 FROM users WHERE id=? AND hash=? AND disabled=0`, userID, hash(credential)).Scan(&valid)
-			cancel()
-			if e != nil {
-				send("unauthorized")
-				return
-			}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		identity, err := a.authenticate(r.WithContext(ctx))
+		cancel()
+		if err != nil || identity.ID != userID || identity.Admin != admin {
+			send("unauthorized")
+			return
 		}
 		if !send(event) {
 			return

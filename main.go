@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
@@ -40,7 +39,6 @@ type App struct {
 	db          *sql.DB
 	upstream    string
 	upstreamKey string
-	admin       string
 	client      *http.Client
 	records     chan []any
 	loggerWG    sync.WaitGroup
@@ -68,11 +66,41 @@ func openDB(path string) (*sql.DB, error) {
 		return nil, e
 	}
 	db.SetMaxOpenConns(8)
-	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL);
+	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,admin INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,prefix TEXT NOT NULL,created TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,key_id INTEGER NOT NULL REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS sessions(hash TEXT PRIMARY KEY,credential_hash TEXT NOT NULL,expires INTEGER NOT NULL);
+ CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);
  CREATE INDEX IF NOT EXISTS requests_time ON requests(time); CREATE INDEX IF NOT EXISTS requests_key ON requests(key_id);`)
-	return db, e
+	if e == nil {
+		var hasAdmin int
+		e = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='admin'`).Scan(&hasAdmin)
+		if e == nil && hasAdmin == 0 {
+			_, e = db.Exec(`ALTER TABLE users ADD COLUMN admin INTEGER NOT NULL DEFAULT 0`)
+		}
+	}
+	if e != nil {
+		db.Close()
+		return nil, e
+	}
+	for _, column := range []string{"username", "password_hash"} {
+		var exists int
+		if e = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('users') WHERE name=?`, column).Scan(&exists); e != nil {
+			db.Close()
+			return nil, e
+		}
+		if exists == 0 {
+			if _, e = db.Exec(`ALTER TABLE users ADD COLUMN ` + column + ` TEXT NOT NULL DEFAULT ''`); e != nil {
+				db.Close()
+				return nil, e
+			}
+		}
+	}
+	if _, e = db.Exec(`UPDATE users SET username='user-'||id WHERE username=''; CREATE UNIQUE INDEX IF NOT EXISTS users_username ON users(username)`); e != nil {
+		db.Close()
+		return nil, e
+	}
+	return db, nil
 }
 func reply(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -101,6 +129,7 @@ func (a *App) handler() http.Handler {
 		reply(w, 200, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("/admin/", a.adminAPI)
+	mux.HandleFunc("/auth/", a.sessionAPI)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -117,15 +146,15 @@ func (a *App) handler() http.Handler {
 	})
 }
 func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
-	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	admin := subtle.ConstantTimeCompare([]byte(credential), []byte(a.admin)) == 1
-	var userID int64
-	var userName string
-	if !admin {
-		if a.db.QueryRow(`SELECT id,name FROM users WHERE hash=? AND disabled=0`, hash(credential)).Scan(&userID, &userName) != nil {
-			fail(w, 401, "valid dashboard token required")
-			return
-		}
+	identity, err := a.authenticate(r)
+	if err != nil {
+		fail(w, 401, "sign-in required")
+		return
+	}
+	admin, userID, userName := identity.Admin, identity.ID, identity.Name
+	if identity.Cookie && r.Method != "GET" && r.Method != "HEAD" && !dashboardMutationAllowed(r) {
+		fail(w, 403, "same-origin dashboard request required")
+		return
 	}
 	scope := "1=1"
 	scopeArgs := []any{}
@@ -148,64 +177,114 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.URL.Path == "/admin/events" && r.Method == "GET":
-		a.liveEvents(w, r, userID, admin, credential)
+		a.liveEvents(w, r, userID, admin)
 	case r.URL.Path == "/admin/me" && r.Method == "GET":
-		reply(w, 200, map[string]any{"admin": admin, "id": userID, "name": userName})
+		reply(w, 200, map[string]any{"admin": admin, "id": userID, "name": userName, "username": identity.Username})
 	case r.URL.Path == "/admin/profile" && r.Method == "POST":
-		var v struct{ Name string }
-		if admin {
-			fail(w, 400, "administrator has no user profile")
+		var v struct {
+			Name            string
+			CurrentPassword string `json:"current_password"`
+			NewPassword     string `json:"new_password"`
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&v) != nil || len(v.Name) > 100 {
+			fail(w, 400, "valid profile required")
 			return
 		}
-		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || strings.TrimSpace(v.Name) == "" || len(v.Name) > 100 {
-			fail(w, 400, "valid name required")
+		var encoded string
+		if v.NewPassword != "" {
+			if !validPassword(v.NewPassword) {
+				fail(w, 400, "password must contain 12 to 1024 characters")
+				return
+			}
+			if a.db.QueryRow(`SELECT password_hash FROM users WHERE id=?`, userID).Scan(&encoded) != nil || !verifyPassword(v.CurrentPassword, encoded) {
+				fail(w, 403, "current password incorrect")
+				return
+			}
+			var err error
+			encoded, err = passwordHash(v.NewPassword)
+			if err != nil {
+				fail(w, 500, "password hashing failed")
+				return
+			}
+		}
+		if strings.TrimSpace(v.Name) == "" && encoded == "" {
+			fail(w, 400, "name or new password required")
 			return
 		}
-		if _, e := a.db.Exec(`UPDATE users SET name=? WHERE id=?`, strings.TrimSpace(v.Name), userID); e != nil {
+		if _, err := a.db.Exec(`UPDATE users SET name=CASE WHEN ?='' THEN name ELSE ? END,password_hash=CASE WHEN ?='' THEN password_hash ELSE ? END WHERE id=?`, strings.TrimSpace(v.Name), strings.TrimSpace(v.Name), encoded, encoded, userID); err != nil {
 			fail(w, 500, "database error")
 			return
 		}
 		a.notifyUser(userID)
 		reply(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/admin/users" && r.Method == "GET":
-		a.query(w, `SELECT id,name,disabled,created FROM users ORDER BY id DESC`)
+		a.query(w, `SELECT id,name,username,disabled,admin,created FROM users ORDER BY id DESC`)
 	case r.URL.Path == "/admin/users" && r.Method == "POST":
-		var v struct{ Name string }
-		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || strings.TrimSpace(v.Name) == "" || len(v.Name) > 100 {
-			fail(w, 400, "valid name required")
+		var v struct {
+			Name, Username, Password string
+			Admin                    bool
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&v) != nil || strings.TrimSpace(v.Name) == "" || len(v.Name) > 100 || !validUsername(normalizeUsername(v.Username)) || (v.Password != "" && !validPassword(v.Password)) {
+			fail(w, 400, "name, valid username and password (12 to 1024 characters) required")
 			return
 		}
-		secret := "mu_" + token()
-		res, e := a.db.Exec(`INSERT INTO users(name,hash,created) VALUES(?,?,?)`, strings.TrimSpace(v.Name), hash(secret), time.Now().UTC().Format(time.RFC3339))
-		if e != nil {
-			fail(w, 500, "database error")
+		if v.Password == "" {
+			v.Password = token()
+		}
+		encoded, err := passwordHash(v.Password)
+		if err != nil {
+			fail(w, 500, "password hashing failed")
+			return
+		}
+		res, err := a.db.Exec(`INSERT INTO users(name,username,password_hash,hash,created,admin) VALUES(?,?,?,?,?,?)`, strings.TrimSpace(v.Name), normalizeUsername(v.Username), encoded, hash(token()), time.Now().UTC().Format(time.RFC3339), v.Admin)
+		if err != nil {
+			fail(w, 409, "username already exists or database unavailable")
 			return
 		}
 		id, _ := res.LastInsertId()
 		a.notifyUser(id)
-		reply(w, 201, map[string]any{"id": id, "token": secret})
+		reply(w, 201, map[string]any{"id": id, "password": v.Password})
 	case r.URL.Path == "/admin/users/update" && r.Method == "POST":
 		var v struct {
-			ID       int64
-			Disabled bool
-			Name     string
-			Rotate   bool
+			ID                 int64
+			Disabled, Admin    *bool
+			Name               string
+			Username, Password *string
+			Rotate             bool
 		}
-		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || v.ID == 0 || len(v.Name) > 100 {
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&v) != nil || v.ID == 0 || len(v.Name) > 100 {
 			fail(w, 400, "valid user required")
 			return
 		}
-		secret := ""
-		var res sql.Result
-		var e error
-		if v.Rotate {
-			secret = "mu_" + token()
-			res, e = a.db.Exec(`UPDATE users SET hash=? WHERE id=?`, hash(secret), v.ID)
-		} else {
-			res, e = a.db.Exec(`UPDATE users SET disabled=?,name=CASE WHEN ?='' THEN name ELSE ? END WHERE id=?`, v.Disabled, strings.TrimSpace(v.Name), strings.TrimSpace(v.Name), v.ID)
+		if v.Username != nil {
+			normalized := normalizeUsername(*v.Username)
+			if !validUsername(normalized) {
+				fail(w, 400, "valid username required")
+				return
+			}
+			v.Username = &normalized
 		}
-		if e != nil {
-			fail(w, 500, "database error")
+		generated := ""
+		if v.Rotate {
+			generated = token()
+			v.Password = &generated
+		}
+		var encoded *string
+		if v.Password != nil {
+			if !validPassword(*v.Password) {
+				fail(w, 400, "password must contain 12 to 1024 characters")
+				return
+			}
+			h, err := passwordHash(*v.Password)
+			if err != nil {
+				fail(w, 500, "password hashing failed")
+				return
+			}
+			encoded = &h
+		}
+		res, err := a.db.Exec(`UPDATE users SET disabled=COALESCE(?,disabled),admin=COALESCE(?,admin),username=COALESCE(?,username),password_hash=COALESCE(?,password_hash),name=CASE WHEN ?='' THEN name ELSE ? END WHERE id=?`, v.Disabled, v.Admin, v.Username, encoded, strings.TrimSpace(v.Name), strings.TrimSpace(v.Name), v.ID)
+		if err != nil {
+			fail(w, 409, "username already exists or database unavailable")
 			return
 		}
 		n, _ := res.RowsAffected()
@@ -214,7 +293,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.notifyUser(v.ID)
-		reply(w, 200, map[string]any{"ok": true, "token": secret})
+		reply(w, 200, map[string]any{"ok": true, "password": generated})
 	case r.URL.Path == "/admin/key-update" && r.Method == "POST":
 		var v struct {
 			ID   int64
@@ -651,26 +730,31 @@ func main() {
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		log.Fatal(e)
 	}
-	adminPath := filepath.Join(dir, "admin-token")
-	b, e := os.ReadFile(adminPath)
-	if os.IsNotExist(e) {
-		b = []byte(token())
-		e = os.WriteFile(adminPath, b, 0600)
-	}
-	if e != nil {
-		log.Fatal(e)
-	}
 	db, e := openDB(filepath.Join(dir, "meter.db"))
 	if e != nil {
 		log.Fatal(e)
 	}
 	defer db.Close()
+	if len(os.Args) > 1 {
+		if len(os.Args) != 3 || os.Args[1] != "reset-password" {
+			log.Fatal("usage: model-meter [reset-password USERNAME]")
+		}
+		password, err := resetPassword(db, os.Args[2])
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Printf("Username: %s\nPassword: %s\n", normalizeUsername(os.Args[2]), password)
+		return
+	}
+	if e = bootstrapAdmin(db); e != nil {
+		log.Fatal(e)
+	}
 	up := strings.TrimRight(env("UPSTREAM_URL", "http://127.0.0.1:8000"), "/")
 	u, e := url.Parse(up)
 	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		log.Fatal("invalid upstream URL")
 	}
-	a := &App{db: db, upstream: up, upstreamKey: os.Getenv("UPSTREAM_API_KEY"), admin: strings.TrimSpace(string(b)), client: &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
+	a := &App{db: db, upstream: up, upstreamKey: os.Getenv("UPSTREAM_API_KEY"), client: &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
 	a.startLogger()
 	defer a.stopLogger()
 	srv := &http.Server{Addr: env("LISTEN_ADDR", ":8001"), Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}

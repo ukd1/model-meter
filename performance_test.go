@@ -78,7 +78,7 @@ func TestPerformanceWindowAndMetrics(t *testing.T) {
 func TestPerformanceIsolationAndEmpty(t *testing.T) {
 	a, s, _ := fixture(t, func(w http.ResponseWriter, r *http.Request) {})
 	for _, name := range []string{"alice", "bob"} {
-		a.db.Exec(`INSERT INTO users(name,hash,created) VALUES(?,?,?)`, name, hash(name), time.Now().Format(time.RFC3339))
+		seedTestUser(t, a, name, name)
 	}
 	a.db.Exec(`UPDATE keys SET user_id=1 WHERE id=1`)
 	a.db.Exec(`INSERT INTO requests(key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,outcome) VALUES(1,?,'m','POST','/v1/chat/completions','local',200,1000,3,5,'complete')`, time.Now().UTC().Format(time.RFC3339Nano))

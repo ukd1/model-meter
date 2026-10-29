@@ -46,14 +46,18 @@ After changing a running installation, use `systemctl --user restart model-meter
 
 1. Check `systemctl --user is-active model-meter` and `GET /healthz` on the configured port. Health confirms the proxy/database, not upstream inference.
 2. Check that `/` serves the dashboard and unauthenticated `/admin/keys` and `/v1/models` return 401.
-3. Read `data/admin-token` into memory to authenticate administrative checks. Do not put credentials in command arguments, logs, screenshots, source, or commits. Tell the operator the token file location; only display its value if explicitly requested.
-4. With `Authorization: Bearer <admin-token>`, create a temporary key using `POST /admin/keys` and JSON `{"name":"Installation verification"}`. Use the returned `key` for `GET /v1/models` and discover an actual upstream model name.
+3. On first setup, retrieve the generated administrator username/password from the startup console or service journal into memory. For an existing installation, use the operator-provided account. Do not put passwords in command arguments, screenshots, source, or commits. Authenticate with JSON username/password at `POST /auth/login`, header `X-Model-Meter: dashboard`, and retain its session cookie privately. The service prints the initial password once; do not reproduce it in reports unless requested.
+4. With the session cookie, `Content-Type: application/json`, and `X-Model-Meter: dashboard`, create a temporary key using `POST /admin/keys` and JSON `{"name":"Installation verification"}`. Use the returned `key` for `GET /v1/models` and discover an actual upstream model name.
 5. Exercise small regular and streamed inference requests for the upstream's supported chat formats. Inspect response usage transiently and compare it with `GET /admin/requests?key=<id>` after allowing the asynchronous writer to flush. Never persist inference bodies. Missing upstream usage must remain unmetered, not fabricated.
 6. Revoke the temporary key with `POST /admin/revoke` and JSON `{"id":<id>}` in cleanup, including after failures. Confirm subsequent API requests with it return 401.
 7. Check `/admin/status` for dropped records. For a fresh installation, restart once and verify health, key revocation, and request history persist. Avoid unnecessary restarts of a busy existing service.
 
-Report the dashboard URL, client base URLs, service status, credential file location, verification results, and any checks that could not be completed. Do not call installation verified if only the process started.
+Report the dashboard URL, client base URLs, service status, initial login retrieval instructions, verification results, and any checks that could not be completed. Do not call installation verified if only the process started.
 
 ## Development and privacy constraints
 
-Keep request accounting asynchronous and bounded. Preserve per-user key/usage isolation. Never log request or response bodies, credentials, arbitrary headers, or URL query strings. Keep missing usage distinguishable from zero. Match streaming usage semantics rather than summing cumulative chunks. Test protocol changes, including streaming and credential handling, before deployment. Runtime data and binaries must remain ignored by Git.
+Keep request accounting asynchronous and bounded. Preserve per-user key/usage isolation. Never log request or response bodies, arbitrary headers, or URL query strings. Do not add credential logging; the initial bootstrap password is printed once by the service for setup. Use username/password sessions for dashboard access and separate API keys for `/v1`. Keep missing usage distinguishable from zero. Match streaming usage semantics rather than summing cumulative chunks. Test protocol changes, including streaming and credential handling, before deployment. Runtime data and binaries must remain ignored by Git.
+
+For password recovery, run `./model-meter reset-password USERNAME` with the service's `DATA_DIR`. It generates a password shown once and revokes that account's sessions. Do not reset an existing password during routine verification. There is no master administrator token or email reset flow.
+
+For upgrades from token sign-in, preserve existing user IDs, API keys, and usage. Migrated accounts use `user-ID` usernames and require a password reset before dashboard login; administrators can then change their usernames. Existing proxy API keys remain valid. Do not recreate accounts as a migration shortcut.

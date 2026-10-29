@@ -15,20 +15,21 @@ function connection(state) {
 function lock(text = '') {
   auth = ''; identity = null; liveGeneration++; liveController?.abort(); refreshScheduled = false;
   $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
-  $('newKey').textContent = ''; $('userToken').textContent = ''; $('adminToken').value = '';
+  $('newKey').textContent = ''; $('userToken').textContent = ''; $('adminToken').value = ''; $('currentPassword').value = ''; $('newPassword').value = '';
   $('secret').hidden = true; $('userSecret').hidden = true; renderCache.clear(); lastProfileName = undefined;
   for (const id of ['keyRows', 'userRows', 'usageRows', 'requestRows']) $(id).replaceChildren();
   $('keyFilter').replaceChildren(new Option('All keys', '')); $('userFilter').replaceChildren(new Option('All users', '')); $('modelFilter').value = ''; chartSeries = []; performanceData = null;
   connection('locked'); message(text);
 }
 async function api(path, body) {
+  const session = auth;
   const response = await fetch('/admin/' + path, {
     method: body ? 'POST' : 'GET',
-    headers: {Authorization: 'Bearer ' + auth, ...(body ? {'Content-Type': 'application/json'} : {})},
+    headers: body ? {'Content-Type': 'application/json', 'X-Model-Meter': 'dashboard'} : {},
     body: body ? JSON.stringify(body) : undefined
   });
   const value = await response.json();
-  if (response.status === 401) { lock('Your session is no longer authorized. Sign in again.'); throw Error('Sign-in token rejected.'); }
+  if (response.status === 401) { if (auth === session) lock('Your session is no longer authorized. Sign in again.'); throw Error('Session expired. Sign in again.'); }
   if (!response.ok) throw Error(value.error?.message || 'Request failed');
   return value;
 }
@@ -71,22 +72,24 @@ function renderKeys(keys) {
 }
 function renderUsers(users) {
   for (const id of ['usersPanel', 'userFilterLabel', 'keyOwnerLabel']) $(id).hidden = !identity.admin;
-  $('profilePanel').hidden = identity.admin;
-  $('identityName').textContent = identity.admin ? 'ADMINISTRATOR' : identity.name;
-  if (!identity.admin) {
-    if (lastProfileName !== identity.name) { $('profileName').value = identity.name; lastProfileName = identity.name; }
-    return;
-  }
+  $('profilePanel').hidden = !identity.id;
+  $('passwordUsername').value = identity.username || '';
+  $('identityName').textContent = identity.id ? identity.name + (identity.admin ? ' / ADMINISTRATOR' : '') : 'ADMINISTRATOR';
+  if (identity.id && lastProfileName !== identity.name) { $('profileName').value = identity.name; lastProfileName = identity.name; }
+  if (!identity.admin) return;
   selectOptions('userFilter', users, u => u.name, 'All users');
   selectOptions('keyOwner', users.filter(u => !u.disabled), u => u.name, 'Administrator');
   if (!changed('userRows', users)) return;
   users.forEach(u => {
-    const tr = row('userRows', [u.name, u.disabled ? 'Disabled' : 'Active', date(u.created)]), target = actions(tr);
-    action(target, 'Rename', async () => { const name = prompt('User name', u.name); if (name) await api('users/update', {id: u.id, name, disabled: !!u.disabled}); });
+    const tr = row('userRows', [u.name, u.admin ? 'Administrator' : 'User', u.disabled ? 'Disabled' : 'Active', date(u.created)]), target = actions(tr);
+    detail(tr.firstChild, u.username);
+    action(target, 'Rename', async () => { const name = prompt('Display name', u.name); if (name) await api('users/update', {id: u.id, name}); });
+    action(target, 'Change username', async () => { const username = prompt('Login username', u.username); if (username) await api('users/update', {id: u.id, username: username.trim()}); });
     action(target, u.disabled ? 'Enable' : 'Disable', async () => { if (confirm((u.disabled ? 'Enable ' : 'Disable ') + u.name + '?')) await api('users/update', {id: u.id, disabled: !u.disabled}); });
-    action(target, 'Reset token', async () => { if (confirm('Invalidate the sign-in token for ' + u.name + '?')) { const value = await api('users/update', {id: u.id, rotate: true}); showUserToken(value.token); } });
+    action(target, u.admin ? 'Make user' : 'Make administrator', async () => { if (confirm('Change ' + u.name + ' to ' + (u.admin ? 'a user with access to their own keys and usage' : 'an administrator with access to all users, keys, and usage') + '?')) await api('users/update', {id: u.id, admin: !u.admin}); });
+    if (u.id !== identity.id) action(target, 'Reset password', async () => { if (confirm('Reset the password for ' + u.name + '? Their existing sessions will close.')) { const value = await api('users/update', {id: u.id, rotate: true}); showUserPassword(value.password); } });
   });
-  empty('userRows', 4, 'No users yet. Add a user to issue their own keys.');
+  empty('userRows', 5, 'No users yet. Add a user to issue their own keys.');
 }
 function renderUsage(usage) {
   const totals = {requests: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0, errors: 0, unmetered: 0, ms: 0};
@@ -118,16 +121,26 @@ async function refresh() {
   refreshing = true; const session = auth;
   try {
     do {
-      pending = false; const q = query();
-      const [me, keys, usage, requests, status, series, users] = await Promise.all([
-        api('me'), api('keys'), api('usage?' + q), api('requests?' + q), api('status'), api('performance?' + q), identity.admin ? api('users') : Promise.resolve([])
+      pending = false; const me = await api('me');
+      if (auth !== session) return;
+      if (identity.admin !== me.admin) {
+        $('userFilter').value = ''; $('keyFilter').value = '';
+        $('userToken').textContent = ''; $('userSecret').hidden = true; renderCache.clear();
+      }
+      const q = query();
+      const [keys, usage, requests, status, series, users] = await Promise.all([
+        api('keys'), api('usage?' + q), api('requests?' + q), api('status'), api('performance?' + q), me.admin ? api('users') : Promise.resolve([])
       ]);
       if (auth !== session) return;
       identity = me; renderKeys(keys); renderUsers(users); renderUsage(usage); renderRequests(requests);
       performanceData = series; chartSeries = series.series; renderCharts(); $('updated').textContent = 'SYNC / ' + new Date().toLocaleTimeString();
       if (status.dropped_records) message('Accounting gap: ' + status.dropped_records + ' records dropped since service start.');
     } while (pending && auth === session);
-  } finally { refreshing = false; }
+  } finally {
+    refreshing = false;
+    // A new login may have arrived while the previous session's reads finished.
+    if (pending && auth && auth !== session) scheduleRefresh();
+  }
 }
 function scheduleRefresh() {
   if (refreshScheduled) return;
@@ -145,12 +158,13 @@ async function startLive() {
     const touch = () => { clearTimeout(watchdog); watchdog = setTimeout(() => controller.abort(), 45000); };
     try {
       connection('connecting'); touch();
-      const response = await fetch('/admin/events', {headers: {Authorization: 'Bearer ' + session}, signal: controller.signal});
+      const response = await fetch('/admin/events', {signal: controller.signal});
+      if (generation !== liveGeneration || auth !== session) return;
       if (response.status === 401) { lock('Your session is no longer authorized. Sign in again.'); return; }
       if (!response.ok || !response.body) throw Error('Live connection unavailable');
       const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '';
       for (;;) {
-        const {value, done} = await reader.read(); if (done) break; touch(); buffer += decoder.decode(value, {stream: true});
+        const {value, done} = await reader.read(); if (generation !== liveGeneration || auth !== session) return; if (done) break; touch(); buffer += decoder.decode(value, {stream: true});
         let end;
         while ((end = buffer.indexOf('\n\n')) !== -1) {
           const event = buffer.slice(0, end).split('\n').find(line => line.startsWith('event:'))?.slice(6).trim(); buffer = buffer.slice(end + 2);
@@ -166,21 +180,59 @@ async function startLive() {
     connection('reconnecting'); await new Promise(resolve => setTimeout(resolve, delay)); delay = Math.min(delay * 2, 10000);
   }
 }
-function showUserToken(value) { $('userToken').textContent = value; $('userSecret').hidden = false; }
+function showUserPassword(value) { $('userToken').textContent = value; $('userSecret').hidden = false; }
 function form(id, handler) {
   $(id).onsubmit = async event => { event.preventDefault(); const button = event.target.querySelector('button'); button.disabled = true; message(''); try { await handler(); } catch (e) { message(e.message); } finally { button.disabled = false; } };
 }
+async function sessionAction(action, body) {
+  const response = await fetch('/auth/' + action, {
+    method: 'POST', headers: {'Content-Type': 'application/json', 'X-Model-Meter': 'dashboard'},
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const value = await response.json().catch(() => ({}));
+    throw Error(value.error?.message || 'Unable to ' + action + '. Please try again.');
+  }
+}
+async function openDashboard(me) {
+  const session = auth = Symbol('session'); identity = me;
+  await refresh();
+  if (auth !== session) return;
+  $('adminToken').value = ''; $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false;
+  switchView('overview'); startLive();
+}
 form('loginForm', async () => {
-  auth = $('adminToken').value.trim();
-  try { identity = await api('me'); await refresh(); $('adminToken').value = ''; $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false; switchView('overview'); startLive(); }
-  catch (e) { lock(e.message); }
+  try {
+    await sessionAction('login', {username: $('loginUsername').value.trim(), password: $('adminToken').value});
+    await openDashboard(await api('me'));
+  } catch (e) { lock(e.message); }
 });
+async function restoreSession() {
+  const button = $('loginForm').querySelector('button'); button.disabled = true;
+  connection('connecting');
+  try {
+    const response = await fetch('/admin/me');
+    if (response.status === 401) { lock(); return; }
+    if (!response.ok) throw Error('Unable to restore your session. Try signing in again.');
+    await openDashboard(await response.json());
+  } catch (e) { lock(e.message); }
+  finally { button.disabled = false; }
+}
 form('createForm', async () => { const value = await api('keys', {name: $('keyName').value, user_id: $('keyOwner').value ? Number($('keyOwner').value) : null}); $('newKey').textContent = value.key; $('secret').hidden = false; $('keyName').value = ''; await refresh(); });
-form('userForm', async () => { const value = await api('users', {name: $('userName').value}); showUserToken(value.token); $('userName').value = ''; await refresh(); });
+form('userForm', async () => { const value = await api('users', {username: $('newUsername').value.trim(), name: $('userName').value, admin: $('userRole').value === 'admin'}); showUserPassword(value.password); $('userName').value = ''; $('newUsername').value = ''; $('userRole').value = 'user'; await refresh(); });
 form('profileForm', async () => { await api('profile', {name: $('profileName').value}); await refresh(); message('Profile saved.'); });
+form('passwordForm', async () => {
+  await api('profile', {current_password: $('currentPassword').value, new_password: $('newPassword').value});
+  lock('Password changed. Sign in again with your new password.');
+});
 $('dismiss').onclick = () => { $('newKey').textContent = ''; $('secret').hidden = true; };
 $('dismissUser').onclick = () => { $('userToken').textContent = ''; $('userSecret').hidden = true; };
-$('logout').onclick = () => lock();
+$('logout').onclick = async () => {
+  $('logout').disabled = true;
+  try { await sessionAction('logout', {}); lock(); }
+  catch (e) { message(e.message); }
+  finally { $('logout').disabled = false; }
+};
 $('refresh').onclick = () => { message(''); scheduleRefresh(); };
 ['period', 'keyFilter', 'modelFilter', 'userFilter'].forEach(id => $(id).onchange = scheduleRefresh);
 document.querySelectorAll('[data-view]').forEach(button => button.onclick = () => switchView(button.dataset.view));
@@ -275,3 +327,5 @@ function drawHistogram(id, distribution, color, unit, summaryID) {
   $(id).replaceChildren(svg);
   $(summaryID).textContent = number(distribution.samples) + ' samples / p50 ' + compact(distribution.p50) + ' ' + unit + ' / p95 ' + compact(distribution.p95) + ' ' + unit;
 }
+
+restoreSession();

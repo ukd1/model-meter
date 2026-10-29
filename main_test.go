@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -20,7 +21,14 @@ func fixture(t *testing.T, upstream http.HandlerFunc) (*App, *httptest.Server, s
 	if e != nil {
 		t.Fatal(e)
 	}
-	a := &App{db: db, admin: "admin-secret", upstream: up.URL, client: up.Client()}
+	a := &App{db: db, upstream: up.URL, client: up.Client()}
+	encoded, err := passwordHash("admin-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`INSERT INTO users(id,name,username,password_hash,hash,admin,created) VALUES(0,'Administrator','admin',?,'legacy-admin',1,?)`, encoded, time.Now().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
 	a.startLogger()
 	_, e = db.Exec(`INSERT INTO keys(name,hash,prefix,created) VALUES(?,?,?,?)`, "test", hash("client-secret"), "client", time.Now().Format(time.RFC3339))
 	if e != nil {
@@ -37,7 +45,14 @@ func call(t *testing.T, s *httptest.Server, path, key, body string) *http.Respon
 		method = "POST"
 	}
 	r, _ := http.NewRequest(method, s.URL+path, strings.NewReader(body))
-	r.Header.Set("Authorization", "Bearer "+key)
+	if strings.HasPrefix(path, "/admin/") {
+		if cookie := testDashboardCookie(t, s, key); cookie != nil {
+			r.AddCookie(cookie)
+		}
+		r.Header.Set("X-Model-Meter", "dashboard")
+	} else {
+		r.Header.Set("Authorization", "Bearer "+key)
+	}
 	r.Header.Set("Content-Type", "application/json")
 	res, e := s.Client().Do(r)
 	if e != nil {
@@ -169,16 +184,15 @@ func TestUserIsolation(t *testing.T) {
 		io.WriteString(w, `{"usage":{"prompt_tokens":2,"completion_tokens":1}}`)
 	})
 	createUser := func(name string) (string, int) {
-		res := call(t, s, "/admin/users", "admin-secret", `{"name":"`+name+`"}`)
+		res := call(t, s, "/admin/users", "admin-secret", `{"name":"`+name+`","username":"`+strings.ToLower(name)+`","password":"`+name+`-password-123"}`)
 		var v struct {
-			Token string
-			ID    int
+			ID int
 		}
 		json.NewDecoder(res.Body).Decode(&v)
-		if v.Token == "" {
+		if res.StatusCode != 201 {
 			t.Fatal("user creation failed")
 		}
-		return v.Token, v.ID
+		return strings.ToLower(name) + ":" + name + "-password-123", v.ID
 	}
 	alice, aliceID := createUser("Alice")
 	bob, _ := createUser("Bob")
@@ -222,4 +236,49 @@ func TestUserIsolation(t *testing.T) {
 	if call(t, s, "/admin/me", alice, "").StatusCode != 401 {
 		t.Fatal("disabled login accepted")
 	}
+}
+
+var testSessionCookies sync.Map
+
+func testDashboardCookie(t *testing.T, s *httptest.Server, credentials string) *http.Cookie {
+	t.Helper()
+	cacheKey := s.URL + ":" + credentials
+	if c, ok := testSessionCookies.Load(cacheKey); ok {
+		return c.(*http.Cookie)
+	}
+	username, password := credentials, credentials
+	if credentials == "admin-secret" {
+		username = "admin"
+	}
+	if parts := strings.SplitN(credentials, ":", 2); len(parts) == 2 {
+		username, password = parts[0], parts[1]
+	}
+	body, _ := json.Marshal(map[string]string{"username": username, "password": password})
+	res := sessionRequest(t, s, "POST", "/auth/login", string(body), nil, true, "")
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return nil
+	}
+	for _, c := range res.Cookies() {
+		if c.MaxAge > 0 {
+			testSessionCookies.Store(cacheKey, c)
+			t.Cleanup(func() { testSessionCookies.Delete(cacheKey) })
+			return c
+		}
+	}
+	t.Fatal("missing session cookie")
+	return nil
+}
+func seedTestUser(t *testing.T, a *App, name, password string) int64 {
+	t.Helper()
+	encoded, err := passwordHash(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := a.db.Exec(`INSERT INTO users(name,username,password_hash,hash,created) VALUES(?,?,?,?,?)`, name, strings.ToLower(name), encoded, hash("legacy-"+name), time.Now().Format(time.RFC3339))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := result.LastInsertId()
+	return id
 }

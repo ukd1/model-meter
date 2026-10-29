@@ -1,16 +1,15 @@
 """Verify supported chat protocols against a running proxy, without saving bodies.
 
-TEST_URL defaults to http://127.0.0.1:8001; ADMIN_TOKEN_FILE defaults to
- data/admin-token. Creates and always revokes one temporary client key.
+TEST_URL defaults to http://127.0.0.1:8001; set ADMIN_USERNAME and ADMIN_PASSWORD. Creates and always revokes one temporary client key.
 """
 import json
 import os
-from pathlib import Path
+import http.cookiejar
 import time
 import urllib.request
 
 base = os.environ.get("TEST_URL", "http://127.0.0.1:8001").rstrip("/")
-admin = Path(os.environ.get("ADMIN_TOKEN_FILE", "data/admin-token")).read_text().strip()
+admin_client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
 def request(path, key, body=None, anthropic=False):
@@ -25,10 +24,13 @@ def request(path, key, body=None, anthropic=False):
 
 
 def api(path, body=None):
-    with request(path, admin, body) as response:
+    req = urllib.request.Request(base + path, headers={"Content-Type": "application/json", "X-Model-Meter": "dashboard"},
+                                 data=json.dumps(body).encode() if body is not None else None)
+    with admin_client.open(req, timeout=180) as response:
         return json.load(response)
 
 
+api("/auth/login", {"username": os.environ.get("ADMIN_USERNAME", "admin"), "password": os.environ["ADMIN_PASSWORD"]})
 created = api("/admin/keys", {"name": "Protocol verification"})
 try:
     with request("/v1/models", created["key"]) as response:
@@ -82,3 +84,4 @@ try:
     print("All four inference protocols passed in JSON and streaming modes.", flush=True)
 finally:
     api("/admin/revoke", {"id": created["id"]})
+    api("/auth/logout", {})

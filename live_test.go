@@ -15,7 +15,7 @@ func eventClient(t *testing.T, server *httptest.Server, token string) (<-chan st
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	r, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/admin/events", nil)
-	r.Header.Set("Authorization", "Bearer "+token)
+	r.AddCookie(testDashboardCookie(t, server, token))
 	response, e := server.Client().Do(r)
 	if e != nil {
 		cancel()
@@ -80,9 +80,7 @@ func TestLiveCommittedAccounting(t *testing.T) {
 func TestLiveUserScopeAndRevocation(t *testing.T) {
 	a, s, _ := fixture(t, func(w http.ResponseWriter, r *http.Request) {})
 	for _, name := range []string{"alice", "bob"} {
-		if _, e := a.db.Exec(`INSERT INTO users(name,hash,created) VALUES(?,?,?)`, name, hash(name), time.Now().Format(time.RFC3339)); e != nil {
-			t.Fatal(e)
-		}
+		seedTestUser(t, a, name, name)
 	}
 	alice, stopAlice := eventClient(t, s, "alice")
 	defer stopAlice()
@@ -102,7 +100,7 @@ func TestLiveUserScopeAndRevocation(t *testing.T) {
 		t.Fatal("other user's activity leaked", e)
 	case <-time.After(50 * time.Millisecond):
 	}
-	res = call(t, s, "/admin/users/update", "admin-secret", `{"id":1,"rotate":true}`)
+	res = call(t, s, "/admin/users/update", "admin-secret", `{"id":1,"password":"replacement-password"}`)
 	io.Copy(io.Discard, res.Body)
 	expectEvent(t, alice, "unauthorized")
 	select {
