@@ -36,6 +36,7 @@ type performancePoint struct {
 type performanceStats struct {
 	Start         string             `json:"start"`
 	End           string             `json:"end"`
+	ExpiresAt     *string            `json:"expires_at"`
 	BucketSeconds int64              `json:"bucket_seconds"`
 	Latency       distribution       `json:"latency"`
 	OutputRate    distribution       `json:"output_rate"`
@@ -122,6 +123,28 @@ func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, 
 	where += ` AND julianday(r.time)<=julianday(?)`
 	args = append(append([]any{}, args...), now.Format(time.RFC3339Nano))
 	stats := performanceStats{Start: start.Format(time.RFC3339Nano), End: now.Format(time.RFC3339Nano), BucketSeconds: chartBucket(now.Sub(start).Seconds()), Series: []performancePoint{}}
+	if r.URL.Query().Get("since") != "" {
+		// Tell the browser when a record next leaves the moving window. Include
+		// every matching request, since errors and model-list calls affect totals
+		// even though they do not contribute to inference distributions.
+		var oldest string
+		e = tx.QueryRowContext(ctx, `SELECT r.time FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY julianday(r.time),r.time LIMIT 1`, args...).Scan(&oldest)
+		if e != nil && e != sql.ErrNoRows {
+			fail(w, 500, "database error")
+			return
+		}
+		if e == nil {
+			at, err := time.Parse(time.RFC3339Nano, oldest)
+			if err != nil {
+				fail(w, 500, "database error")
+				return
+			}
+			// Leave a small margin past SQLite's inclusive, millisecond-precision
+			// boundary so browser timer rounding does not immediately rearm it.
+			expires := at.Add(now.Sub(start)).Add(50 * time.Millisecond).UTC().Format(time.RFC3339Nano)
+			stats.ExpiresAt = &expires
+		}
+	}
 	stats.Latency, e = distributionFor(ctx, tx, where, args, `r.duration_ms/1000.0`, []float64{0, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300})
 	if e != nil {
 		fail(w, 500, "database error")

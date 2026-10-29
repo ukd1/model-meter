@@ -8,14 +8,17 @@ let auth = '', identity = null, refreshing = false, pending = false, refreshSche
 let liveController, liveGeneration = 0, currentView = 'overview', lastProfileName;
 let chartSeries = [], performanceData = null, renderCache = new Map();
 let settings = null;
+let chartSnapshot = null, chartTimer, liveConnected = false;
 
 function message(text) { $('message').textContent = text; $('message').hidden = !text; }
 function connection(state) {
+  liveConnected = state === 'live';
   $('connectionState').textContent = state.toUpperCase();
   $('statusDot').title = 'Live updates: ' + state;
   $('statusDot').className = 'status-dot' + (state === 'live' ? ' live' : state === 'reconnecting' ? ' retry' : '');
 }
 function lock(text = '') {
+  clearTimeout(chartTimer); chartSnapshot = null;
   auth = ''; identity = null; liveGeneration++; liveController?.abort(); refreshScheduled = false;
   settings = null; $('anonymousPanel').hidden = true;
   $('navigation').hidden = true; $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
@@ -56,6 +59,7 @@ function switchView(view) {
   document.querySelectorAll('.view').forEach(el => el.hidden = el.id !== 'view-' + view);
   document.querySelectorAll('[data-view]').forEach(el => { const selected = el.dataset.view === view; el.classList.toggle('selected', selected); el.setAttribute('aria-pressed', selected); });
   $('filters').hidden = view === 'access';
+  advanceChartClock();
 }
 function action(parent, label, handler, danger = false) {
   const button = document.createElement('button'); button.type = 'button'; button.className = danger ? 'danger' : 'secondary'; button.textContent = label;
@@ -146,15 +150,26 @@ async function refresh() {
         $('userFilter').value = ''; $('keyFilter').value = '';
         $('userToken').textContent = ''; $('userSecret').hidden = true; renderCache.clear();
       }
-      const q = query();
+      const q = query(), boundedWindow = Number($('period').value) > 0;
       const [keys, usage, requests, status, series, users, currentSettings] = await Promise.all([
         api('keys'), api('usage?' + q), api('requests?' + q), api('status'), api('performance?' + q), me.admin ? api('users') : Promise.resolve([]), me.admin ? api('settings') : Promise.resolve(null)
       ]);
       if (auth !== session) return;
       identity = me; renderKeys(keys); renderUsers(users); renderSettings(currentSettings); renderUsage(usage); renderRequests(requests);
-      performanceData = series; chartSeries = series.series; renderCharts();
+      performanceData = series; chartSeries = series.series;
+      chartSnapshot = {received: performance.now(), start: Date.parse(series.start), end: Date.parse(series.end), bounded: boundedWindow, expiry: series.expires_at ? Date.parse(series.expires_at) : null, expiryRequested: false};
+      renderCharts(); scheduleChartClock();
       if (status.dropped_records) message('Accounting gap: ' + status.dropped_records + ' records dropped since service start.');
     } while (pending && auth === session);
+  } catch (error) {
+    if (auth === session && chartSnapshot?.expiryRequested) {
+      // A transient failure must not consume the only idle-window update.
+      chartSnapshot.expiryRequested = false;
+      chartSnapshot.retryDelay = Math.min((chartSnapshot.retryDelay || 1000) * 2, 30000);
+      chartSnapshot.retryAt = performance.now() + chartSnapshot.retryDelay;
+      scheduleChartClock();
+    }
+    throw error;
   } finally {
     refreshing = false;
     // A new login may have arrived while the previous session's reads finished.
@@ -167,8 +182,8 @@ function scheduleRefresh() {
   queueMicrotask(() => { refreshScheduled = false; refresh().catch(e => message(e.message)); });
 }
 
-// One authenticated fetch stream. Only changes trigger data reads; heartbeats
-// maintain the connection and advance chart axes using already-loaded data.
+// One authenticated fetch stream. Changes trigger data reads; heartbeats only
+// maintain the connection. A local clock advances charts between changes.
 async function startLive() {
   liveController?.abort();
   const generation = ++liveGeneration, session = auth; let delay = 500;
@@ -190,7 +205,6 @@ async function startLive() {
           if (event === 'unauthorized') { lock('Your session is no longer authorized. Sign in again.'); return; }
           if (event === 'ready') { delay = 500; connection('live'); scheduleRefresh(); }
           if (event === 'change') { $('statusDot').classList.add('flash'); setTimeout(() => $('statusDot').classList.remove('flash'), 600); scheduleRefresh(); }
-          if (event === 'heartbeat') renderCharts();
         }
       }
     } catch (_) { /* A disconnected stream reconnects and reloads a fresh view. */ }
@@ -273,23 +287,59 @@ $('baseURL').textContent = location.origin + '/v1';
 window.addEventListener('offline', () => liveController?.abort());
 window.addEventListener('online', () => { if (auth) startLive(); });
 window.addEventListener('resize', () => { if (auth) requestAnimationFrame(renderCharts); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden && auth) scheduleRefresh(); });
+document.addEventListener('visibilitychange', () => {
+  clearTimeout(chartTimer);
+  if (!document.hidden && auth) { advanceChartClock(); scheduleRefresh(); }
+});
+
+function chartBounds() {
+  const end = chartSnapshot.end + Math.max(0, performance.now() - chartSnapshot.received);
+  return {start: chartSnapshot.bounded ? end - (chartSnapshot.end - chartSnapshot.start) : chartSnapshot.start, end};
+}
+function scheduleChartClock() {
+  clearTimeout(chartTimer);
+  if (!auth || !chartSnapshot || document.hidden || currentView === 'access') return;
+  const untilExpiry = chartSnapshot.expiry != null && !chartSnapshot.expiryRequested ? Math.max(50, chartSnapshot.expiry - chartBounds().end, (chartSnapshot.retryAt || 0) - performance.now()) : Infinity;
+  const delay = currentView === 'overview' ? Math.min(2000, untilExpiry) : untilExpiry;
+  if (Number.isFinite(delay)) chartTimer = setTimeout(advanceChartClock, Math.min(delay, 2147483647));
+}
+function advanceChartClock() {
+  clearTimeout(chartTimer);
+  if (!auth || !chartSnapshot || document.hidden || currentView === 'access') return;
+  if (chartSnapshot.expiry != null && !chartSnapshot.expiryRequested && chartBounds().end >= chartSnapshot.expiry && performance.now() >= (chartSnapshot.retryAt || 0)) {
+    // One refresh for this known expiration. A new snapshot arms the next one.
+    chartSnapshot.expiryRequested = true;
+    scheduleRefresh();
+  }
+  if (currentView === 'overview') renderTimeCharts();
+  scheduleChartClock();
+}
+function displayBucket(bounds) {
+  const minimum = performanceData.bucket_seconds, span = (bounds.end - bounds.start) / 1000;
+  const preferred = [1, 5, 10, 30, 60, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400, 604800].find(step => step >= minimum && span / step <= 120);
+  return Math.ceil((preferred || Math.ceil(span / 120 / 86400) * 86400) / minimum) * minimum;
+}
+
 
 function compact(value) {
   if (value == null) return '—';
   return new Intl.NumberFormat(undefined, {maximumFractionDigits: value < 10 ? 2 : 1, notation: value >= 10000 ? 'compact' : 'standard'}).format(value);
 }
 function windowLabel() { return $('period').selectedOptions[0].textContent; }
-function bucketLabel() {
-  const seconds = performanceData.bucket_seconds;
+function bucketLabel(seconds = performanceData.bucket_seconds) {
   return seconds < 60 ? seconds + 's' : seconds < 3600 ? (seconds / 60) + 'm' : seconds < 86400 ? (seconds / 3600) + 'h' : (seconds / 86400) + 'd';
+}
+function renderTimeCharts() {
+  if (!performanceData || !chartSnapshot) return;
+  const bounds = chartBounds(), step = displayBucket(bounds);
+  document.querySelectorAll('.window-caption').forEach(el => el.textContent = windowLabel() + ' / ' + bucketLabel(step) + ' buckets');
+  drawChart('requestChart', ['requests'], ['#b5ff55'], bounds, step);
+  drawChart('tokenChart', ['input_tokens', 'output_tokens'], ['#b5ff55', '#b69aff'], bounds, step);
+  drawChart('speedChart', ['output_tps'], ['#b69aff'], bounds, step);
 }
 function renderCharts() {
   if (!performanceData) return;
-  document.querySelectorAll('.window-caption').forEach(el => el.textContent = windowLabel() + ' / ' + bucketLabel() + ' buckets');
-  drawChart('requestChart', ['requests'], ['#b5ff55']);
-  drawChart('tokenChart', ['input_tokens', 'output_tokens'], ['#b5ff55', '#b69aff']);
-  drawChart('speedChart', ['output_tps'], ['#b69aff']);
+  renderTimeCharts();
   drawHistogram('latencyHistogram', performanceData.latency, '#b5ff55', 's', 'latencySummary');
   drawHistogram('speedHistogram', performanceData.output_rate, '#b69aff', 'tok/s', 'speedSummary');
 }
@@ -306,14 +356,26 @@ function svgChart(id, height) {
   function title(element, text) { const t = document.createElementNS(NS, 'title'); t.textContent = text; element.append(t); }
   return {svg, width, el, title};
 }
-function drawChart(id, fields, colors) {
-  const {svg, width, el, title} = svgChart(id, 190), right = width - 10, step = performanceData.bucket_seconds;
-  const first = Math.floor(Date.parse(performanceData.start) / 1000 / step) * step;
-  const last = Math.floor(Date.parse(performanceData.end) / 1000 / step) * step;
-  const byTime = new Map(chartSeries.map(r => [Date.parse(r.time) / 1000, r]));
-  const bins = Array.from({length: Math.max(1, Math.min(122, Math.round((last - first) / step) + 1))}, (_, i) => ({time: first + i * step, ...byTime.get(first + i * step)}));
+function drawChart(id, fields, colors, bounds, step) {
+  const {svg, width, el, title} = svgChart(id, 190), right = width - 10;
+  const first = Math.floor(bounds.start / 1000 / step) * step;
+  const last = Math.floor(bounds.end / 1000 / step) * step;
+  // Rebin for expanding all-time views without discarding the oldest history.
+  const byTime = new Map();
+  for (const row of chartSeries) {
+    const time = Math.floor(Date.parse(row.time) / 1000 / step) * step;
+    const bin = byTime.get(time) || {time, requests: 0, input_tokens: 0, output_tokens: 0, rate_samples: 0, rate_sum: 0};
+    for (const field of ['requests', 'input_tokens', 'output_tokens']) bin[field] += row[field] || 0;
+    if (row.output_tps != null && row.rate_samples > 0) { bin.rate_sum += row.output_tps * row.rate_samples; bin.rate_samples += row.rate_samples; }
+    byTime.set(time, bin);
+  }
+  const bins = Array.from({length: Math.max(1, Math.round((last - first) / step) + 1)}, (_, i) => {
+    const time = first + i * step;
+    return byTime.get(time) || {time};
+  });
   const rate = id === 'speedChart';
-  const get = (bin, field) => rate ? (bin[field] ?? null) : (bin[field] || 0) * 60 / step;
+  const get = (bin, field) => rate ? (bin.rate_samples ? bin.rate_sum / bin.rate_samples : null) :
+    (bin.time * 1000 <= chartSnapshot.end || liveConnected ? (bin[field] || 0) * 60 / step : null);
   const values = bins.flatMap(bin => fields.map(field => get(bin, field))).filter(v => v != null);
   const largest = Math.max(0, ...values), max = largest > 0 ? largest * 1.1 : 1;
   for (let i = 0; i < 4; i++) {
@@ -321,24 +383,28 @@ function drawChart(id, fields, colors) {
     el('line', {x1: 48, x2: right, y1: y, y2: y, stroke: '#253129', 'stroke-dasharray': '2 5'});
     el('text', {x: 0, y: y + 4, fill: '#89968d', 'font-size': 10}, compact(max * (1 - i / 3)));
   }
+  const clip = el('clipPath', {id: id + '-plot'});
+  clip.append(el('rect', {x: 48, y: 8, width: right - 48, height: 150}));
+  const plot = el('g', {'clip-path': 'url(#' + id + '-plot)'});
   fields.forEach((field, j) => {
     let path = '', open = false;
-    bins.forEach((bin, i) => {
-      const value = get(bin, field), x = 48 + i * (right - 48) / Math.max(1, bins.length - 1);
+    bins.forEach(bin => {
+      const value = get(bin, field);
       if (value == null) { open = false; return; }
+      const stamp = bin.time * 1000;
+      const x = 48 + (Math.max(bounds.start, stamp) - bounds.start) * (right - 48) / Math.max(1, bounds.end - bounds.start);
       const y = 152 - value / max * 138;
       path += (open ? ' L ' : ' M ') + x + ',' + y; open = true;
       if (value > 0 || rate) {
-        const circle = el('circle', {cx: x, cy: y, r: 3, fill: colors[j]});
-        const stamp = typeof bin.time === 'string' ? bin.time : bin.time * 1000;
-        title(circle, date(stamp) + ' / ' + compact(value) + (rate ? ' output tok/s / ' + bin.rate_samples + ' requests' : ' per minute / ' + bucketLabel() + ' bucket'));
+        const circle = el('circle', {cx: x, cy: y, r: 3, fill: colors[j]}); plot.append(circle);
+        title(circle, date(stamp) + ' / ' + compact(value) + (rate ? ' output tok/s / ' + bin.rate_samples + ' requests' : ' per minute / ' + bucketLabel(step) + ' bucket'));
       }
     });
-    el('path', {d: path, fill: 'none', stroke: colors[j], 'stroke-width': 2, 'stroke-linejoin': 'round'});
+    plot.append(el('path', {d: path, fill: 'none', stroke: colors[j], 'stroke-width': 2, 'stroke-linejoin': 'round'}));
   });
   if (!values.length || (!rate && !largest)) el('text', {x: (48 + right) / 2, y: 83, fill: '#89968d', 'font-size': 11, 'text-anchor': 'middle'}, 'NO SAMPLES IN WINDOW');
-  const startDate = new Date(performanceData.start), endDate = new Date(performanceData.end);
-  const format = date => (endDate - startDate) > 86400000 ? date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'}) : date.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit'});
+  const startDate = new Date(bounds.start), endDate = new Date(bounds.end), span = bounds.end - bounds.start;
+  const format = date => span > 86400000 ? date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'}) : date.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit', ...(span <= 900000 ? {second: '2-digit'} : {})});
   el('text', {x: 48, y: 180, fill: '#89968d', 'font-size': 10}, format(startDate));
   el('text', {x: right, y: 180, fill: '#b5ff55', 'font-size': 10, 'text-anchor': 'end'}, format(endDate));
   $(id).replaceChildren(svg);
