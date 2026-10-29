@@ -4,7 +4,7 @@ Go gateway and dashboard for an OpenAI-compatible upstream. Both run on **port 8
 
 ## Use
 
-Open `http://<server>:8001`. Read the initial administrator sign-in token with:
+Open `http://<server>:8001`. From the project directory, read the initial administrator sign-in token with:
 
 ```sh
 cat ./data/admin-token
@@ -44,6 +44,18 @@ go build -o model-meter .
 systemctl --user status model-meter
 systemctl --user restart model-meter
 journalctl --user -u model-meter
+```
+
+The supplied user service assumes the checkout is at `$HOME/model-meter`. Systemd uses `%h` to expand the user's home directory in unit files; it does not use shell-style `$HOME` expansion for these paths. For a different checkout location, adjust the paths in the unit before installing it. Running `./model-meter` directly uses a `data/` directory relative to the current working directory unless `DATA_DIR` is set.
+
+Install the service from the project directory after building:
+
+```sh
+mkdir -p ./data "$HOME/.config/systemd/user"
+chmod 700 ./data
+cp ./deploy/model-meter.service "$HOME/.config/systemd/user/model-meter.service"
+systemctl --user daemon-reload
+systemctl --user enable --now model-meter
 ```
 
 The installed unit is in `~/.config/systemd/user/model-meter.service`; the repository copy is `deploy/model-meter.service`. Configuration: `LISTEN_ADDR`, `UPSTREAM_URL` (origin without `/v1`), `DATA_DIR`, and optional `UPSTREAM_API_KEY`. Service overrides can be placed in ignored `data/service.env` with mode 0600. Upstream credentials are not managed in the UI: its keys identify callers of this gateway.
