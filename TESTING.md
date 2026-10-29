@@ -35,3 +35,12 @@ All eight inference records matched the upstream's usage after normalization. Th
 - The reconnect test took the browser offline, observed RECONNECTING, restored connectivity, and verified a new stream reached LIVE. An idle 16-second window spanning a keepalive produced zero dashboard data reads.
 - Isolated preview tests observed visible request updates in 119–183 ms. A browser check on the deployed port 8001 observed an update in 250 ms with zero dropped accounting records. These are observed dashboard-update timings, not inference benchmarks or latency guarantees.
 - Desktop/mobile screenshots inspected. Synthetic chart data was used only in the isolated preview database, not production. Deployed screenshot: `/tmp/model-meter-live-desktop.png`. Temporary test keys revoked and test accounts disabled.
+
+## Windowed performance charts and immediate updates — 2026-10-29
+
+- Removed the logger's 250 ms batch timer and the browser's 100 ms debounce. The asynchronous writer now drains only already-queued records (up to 100 per transaction), commits immediately, and sends the change event. Browser refreshes are coalesced in a microtask, with no fixed delay.
+- Added full-window latency and end-to-end output-speed histograms with nearest-rank p50/p95, plus an output-speed time graph. All graphs now follow the selected window with adaptive bucket sizes. The speed definition is output tokens divided by full request duration, not decode-only speed.
+- `go test -race ./...`, `go vet ./...`, build, and JavaScript syntax validation passed. Tests cover more than 200 samples, older-than-one-hour data, interval boundaries, missing/zero-duration usage, excluded non-inference/errors/interrupted requests, all-time windows, empty results, invalid timestamps, and cross-user filtering.
+- Isolated browser fixture: 1h/24h/7d selections produced 250/251/252 histogram samples with the expected 100 tok/s median. All five charts rendered, with desktop/mobile screenshots inspected and no horizontal page overflow. Synthetic fixture data remained in the isolated preview database only.
+- The full browser workflow passed live updates (18 ms observed), zero idle polling, offline/reconnect, key rename/revocation, and disabled-session enforcement. After deployment, a browser smoke check observed a 16 ms update with zero dropped records; these are observations, not latency guarantees.
+- Live performance endpoint verified: histogram counts and time-series rate sample counts reconcile. Service healthy on port 8001; temporary verification key revoked.
