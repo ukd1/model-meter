@@ -326,23 +326,35 @@ func (a *App) query(w http.ResponseWriter, q string, args ...any) {
 }
 
 type Meter struct {
-	Input    *int64
-	Output   *int64
-	Cached   *int64
-	Model    string
-	buf      []byte
-	SSE      bool
-	overflow bool
+	Input      *int64
+	Output     *int64
+	Cached     *int64
+	Model      string
+	buf        []byte
+	SSE        bool
+	overflow   bool
+	Anthropic  bool
+	rawInput   *int64
+	cacheRead  *int64
+	cacheWrite *int64
 }
 
-func (m *Meter) parse(b []byte) {
+func (m *Meter) parse(b []byte) { m.parseEnvelope(b, 0) }
+
+func (m *Meter) parseEnvelope(b []byte, depth int) {
+	if depth > 4 {
+		return
+	}
 	var v struct {
+		Type  string `json:"type"`
 		Model string `json:"model"`
 		Usage *struct {
 			Prompt        *int64 `json:"prompt_tokens"`
 			Completion    *int64 `json:"completion_tokens"`
 			Input         *int64 `json:"input_tokens"`
 			Output        *int64 `json:"output_tokens"`
+			CacheRead     *int64 `json:"cache_read_input_tokens"`
+			CacheWrite    *int64 `json:"cache_creation_input_tokens"`
 			PromptDetails struct {
 				Cached *int64 `json:"cached_tokens"`
 			} `json:"prompt_tokens_details"`
@@ -351,28 +363,107 @@ func (m *Meter) parse(b []byte) {
 			} `json:"input_tokens_details"`
 		} `json:"usage"`
 		Response json.RawMessage `json:"response"`
+		Message  json.RawMessage `json:"message"`
 	}
 	if json.Unmarshal(b, &v) != nil {
 		return
 	}
+	if v.Type == "message" || v.Type == "message_start" || v.Type == "message_delta" {
+		m.Anthropic = true
+	}
 	if len(v.Response) > 0 {
-		m.parse(v.Response)
+		m.parseEnvelope(v.Response, depth+1)
+	}
+	if v.Type == "message_start" && len(v.Message) > 0 {
+		m.parseEnvelope(v.Message, depth+1)
 	}
 	if v.Model != "" && len(v.Model) <= 256 {
 		m.Model = v.Model
 	}
-	if v.Usage != nil {
-		u := v.Usage
+	if v.Usage == nil {
+		return
+	}
+	u := v.Usage
+	// Usage events are cumulative snapshots; merge only fields actually present.
+	if u.Prompt != nil {
 		m.Input = u.Prompt
+	}
+	if u.Completion != nil {
 		m.Output = u.Completion
+	}
+	if u.PromptDetails.Cached != nil {
 		m.Cached = u.PromptDetails.Cached
+	}
+	if u.Output != nil {
+		m.Output = u.Output
+	}
+	if !m.Anthropic {
 		if u.Input != nil {
 			m.Input = u.Input
-			m.Output = u.Output
+		}
+		if u.InputDetails.Cached != nil {
 			m.Cached = u.InputDetails.Cached
 		}
+		return
+	}
+	// Anthropic excludes cache reads/writes from input_tokens. Normalize to the
+	// total input convention used by Chat Completions and Responses.
+	if u.Input != nil {
+		m.rawInput = u.Input
+	}
+	if u.CacheRead != nil {
+		m.cacheRead = u.CacheRead
+		m.Cached = u.CacheRead
+	}
+	if u.CacheWrite != nil {
+		m.cacheWrite = u.CacheWrite
+	}
+	if m.rawInput != nil {
+		total := *m.rawInput
+		if m.cacheRead != nil {
+			total += *m.cacheRead
+		}
+		if m.cacheWrite != nil {
+			total += *m.cacheWrite
+		}
+		m.Input = &total
 	}
 }
+
+// Accept SDK-standard authentication without forwarding the caller's key.
+func proxyCredential(r *http.Request) string {
+	bearer := ""
+	auth := r.Header.Get("Authorization")
+	if strings.HasPrefix(auth, "Bearer ") {
+		bearer = strings.TrimPrefix(auth, "Bearer ")
+	}
+	apiKey := r.Header.Get("X-Api-Key")
+	if auth != "" && bearer == "" {
+		return ""
+	}
+	if bearer != "" && apiKey != "" && bearer != apiKey {
+		return ""
+	}
+	if bearer != "" {
+		return bearer
+	}
+	return apiKey
+}
+
+// Dynamic model identifiers stay out of persisted URL metadata.
+func proxyRoute(path string) (label, method string) {
+	switch path {
+	case "/v1/models":
+		return path, "GET"
+	case "/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages", "/v1/embeddings":
+		return path, "POST"
+	}
+	if id, ok := strings.CutPrefix(path, "/v1/models/"); ok && id != "" && !strings.Contains(id, "/") {
+		return "/v1/models/:model", "GET"
+	}
+	return "unsupported", ""
+}
+
 func (m *Meter) Write(p []byte) (int, error) {
 	n := len(p)
 	if !m.SSE {
@@ -412,21 +503,17 @@ func (m *Meter) finish() {
 }
 func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	var id int64
-	if a.db.QueryRow(`SELECT k.id FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.user_id IS NULL OR u.disabled=0)`, hash(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))).Scan(&id) != nil {
+	if a.db.QueryRow(`SELECT k.id FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.user_id IS NULL OR u.disabled=0)`, hash(proxyCredential(r))).Scan(&id) != nil {
 		fail(w, 401, "valid proxy key required")
 		return
 	}
 	start := time.Now()
 	status := 502
 	outcome := "upstream_error"
-	m := &Meter{}
+	m := &Meter{Anthropic: r.URL.Path == "/v1/messages"}
 	source, _, _ := net.SplitHostPort(r.RemoteAddr)
 	// Store only a known route label, never query parameters or arbitrary URL content.
-	path := r.URL.Path
-	allowed := map[string]string{"/v1/models": "GET", "/v1/chat/completions": "POST", "/v1/completions": "POST", "/v1/embeddings": "POST", "/v1/responses": "POST"}
-	if _, ok := allowed[path]; !ok {
-		path = "unsupported"
-	}
+	path, method := proxyRoute(r.URL.Path)
 	defer func() {
 		record := []any{id, start.UTC().Format(time.RFC3339Nano), m.Model, r.Method, path, source, status, time.Since(start).Milliseconds(), m.Input, m.Output, m.Cached, outcome}
 		select {
@@ -436,7 +523,7 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if allowed[r.URL.Path] != r.Method {
+	if method != r.Method {
 		status = 405
 		outcome = "rejected"
 		fail(w, status, "unsupported endpoint or method")
@@ -451,7 +538,7 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == "POST" {
 		var obj map[string]json.RawMessage
-		if json.Unmarshal(body, &obj) != nil {
+		if json.Unmarshal(body, &obj) != nil || obj == nil {
 			status = 400
 			outcome = "rejected"
 			fail(w, status, "JSON object required")
@@ -481,8 +568,18 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	// Forward only protocol control headers, never arbitrary client headers.
+	for _, header := range []string{"Anthropic-Version", "Anthropic-Beta", "OpenAI-Beta"} {
+		if value := r.Header.Get(header); value != "" {
+			req.Header.Set(header, value)
+		}
+	}
 	if a.upstreamKey != "" {
-		req.Header.Set("Authorization", "Bearer "+a.upstreamKey)
+		if m.Anthropic || r.Header.Get("X-Api-Key") != "" {
+			req.Header.Set("X-Api-Key", a.upstreamKey)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+a.upstreamKey)
+		}
 	}
 	res, e := a.client.Do(req)
 	if e != nil {
@@ -492,7 +589,7 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	defer res.Body.Close()
 	status = res.StatusCode
 	m.SSE = strings.Contains(res.Header.Get("Content-Type"), "text/event-stream")
-	for _, k := range []string{"Content-Type", "Retry-After", "X-Request-Id"} {
+	for _, k := range []string{"Content-Type", "Retry-After", "X-Request-Id", "Request-Id"} {
 		if v := res.Header.Get(k); v != "" {
 			w.Header().Set(k, v)
 		}

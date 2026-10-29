@@ -1,6 +1,6 @@
 # Model Meter
 
-Go gateway and dashboard for an OpenAI-compatible upstream. Both run on **port 8001**; the upstream defaults to **http://127.0.0.1:8000**. SQLite stores users, hashed credentials, and request metadata.
+Go gateway and dashboard for an OpenAI/Anthropic-compatible upstream. Both run on **port 8001**; the upstream defaults to **http://127.0.0.1:8000**. SQLite stores users, hashed credentials, and request metadata.
 
 ## Install with an AI agent
 
@@ -31,7 +31,35 @@ curl "$OPENAI_BASE_URL/chat/completions" \
   -d '{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"Hello"}],"max_tokens":32}'
 ```
 
-Supported routes: `GET /v1/models`, `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and `/v1/responses`. Upstream support determines which routes work. Streaming is forwarded incrementally. For streaming chat/completions the gateway sets `stream_options.include_usage=true`. Other request JSON values are preserved semantically. Usage extraction supports chat/completions, embeddings, and Responses JSON/SSE formats. API errors retain upstream status and response body.
+## API compatibility
+
+| Method | Route | Format |
+| --- | --- | --- |
+| GET | `/v1/models` | Model list |
+| GET | `/v1/models/{model}` | Individual model lookup |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions, JSON or SSE |
+| POST | `/v1/responses` | OpenAI Responses, JSON or SSE |
+| POST | `/v1/completions` | Legacy OpenAI Completions, JSON or SSE |
+| POST | `/v1/messages` | Anthropic Messages, JSON or SSE |
+| POST | `/v1/embeddings` | OpenAI embeddings, when supported upstream |
+
+These cover DS4's model and inference routes. Upstream support determines which routes work; the gateway forwards each protocol without converting it to another API. DS4 does not expose embeddings, Anthropic token counting, or stored Responses retrieval/deletion in the inspected route table, so those are not claimed as DS4 features. The gateway does not implement token counting or stored-response routes.
+
+OpenAI clients use base URL `http://<server>:8001/v1`. Anthropic clients use base URL `http://<server>:8001` and the same dashboard-issued client keys via `x-api-key` or `Authorization: Bearer`. Conflicting credentials are rejected. Example:
+
+```sh
+export ANTHROPIC_BASE_URL=http://<server>:8001
+export ANTHROPIC_API_KEY=mm_<key-created-in-dashboard>
+curl "$ANTHROPIC_BASE_URL/v1/messages" \
+  -H "x-api-key: $ANTHROPIC_API_KEY" \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"deepseek-v4.1-flash","max_tokens":32,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+The proxy forwards `anthropic-version`, `anthropic-beta`, and `openai-beta` protocol headers. When `UPSTREAM_API_KEY` is configured, it replaces the client credential: Anthropic Messages and requests authenticated with `x-api-key` use upstream `x-api-key`; other requests use upstream Bearer authentication. Request IDs and retry-after headers are preserved. API errors retain upstream status and response body.
+
+Streaming is forwarded incrementally. For streaming Chat/legacy Completions, the gateway sets `stream_options.include_usage=true`; other JSON requests are passed through unchanged. Usage extraction handles Chat/Completions and Responses envelopes, plus Anthropic's initial `message_start` and cumulative `message_delta` counters. Anthropic total input is normalized as `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`; cached input displays cache-read tokens. This keeps input totals comparable with OpenAI usage without double-counting stream snapshots. See the [Anthropic streaming protocol](https://platform.claude.com/docs/en/build-with-claude/streaming).
 
 ## Accounting and privacy
 
@@ -75,3 +103,7 @@ The local deployment uses HTTP, like the existing upstream. Use a trusted networ
 `tests/browser.cjs` exercises the deployed dashboard with Playwright. It creates a QA user/key, tests both roles, checks graphs and mobile sizing, then revokes the key and disables the user. It requires Node 20+ and Playwright with Chromium installed; supply `NODE_PATH` if Playwright is installed outside this repository. `TEST_URL` and `ADMIN_TOKEN_FILE` override its defaults. It writes screenshots under `/tmp`, without full credentials visible.
 
 Streaming usage follows the [OpenAI streaming event format](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events).
+
+## Live protocol verification
+
+Run `python3 tests/protocol_smoke.py` from the checkout to test model discovery and all four inference protocols in regular and streaming modes against a running DS4-backed proxy. It compares upstream usage with persisted accounting and revokes its temporary client key in cleanup. It runs eight short inference requests; response bodies and credentials are never written to disk. Override `TEST_URL` and `ADMIN_TOKEN_FILE` for another deployment. Other upstreams may implement only a subset of the tested routes.
