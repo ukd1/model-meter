@@ -10,11 +10,12 @@ let chartSeries = [], performanceData = null, renderCache = new Map();
 function message(text) { $('message').textContent = text; $('message').hidden = !text; }
 function connection(state) {
   $('connectionState').textContent = state.toUpperCase();
+  $('statusDot').title = 'Live updates: ' + state;
   $('statusDot').className = 'status-dot' + (state === 'live' ? ' live' : state === 'reconnecting' ? ' retry' : '');
 }
 function lock(text = '') {
   auth = ''; identity = null; liveGeneration++; liveController?.abort(); refreshScheduled = false;
-  $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
+  $('navigation').hidden = true; $('dashboard').hidden = true; $('logout').hidden = true; $('login').hidden = false;
   $('identityName').hidden = true; $('identityName').textContent = ''; $('identityName').title = '';
   $('newKey').textContent = ''; $('userToken').textContent = ''; $('adminToken').value = ''; $('currentPassword').value = ''; $('newPassword').value = '';
   $('secret').hidden = true; $('userSecret').hidden = true; renderCache.clear(); lastProfileName = undefined;
@@ -200,7 +201,7 @@ async function openDashboard(me) {
   const session = auth = Symbol('session'); identity = me;
   await refresh();
   if (auth !== session) return;
-  $('adminToken').value = ''; $('login').hidden = true; $('dashboard').hidden = false; $('logout').hidden = false; $('identityName').hidden = false;
+  $('adminToken').value = ''; $('login').hidden = true; $('dashboard').hidden = false; $('navigation').hidden = false; $('logout').hidden = false; $('identityName').hidden = false;
   switchView('overview'); startLive();
 }
 form('loginForm', async () => {
