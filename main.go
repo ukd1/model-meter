@@ -1,0 +1,502 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"database/sql"
+	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	_ "github.com/mattn/go-sqlite3"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+//go:embed index.html
+var page []byte
+
+type App struct {
+	db          *sql.DB
+	upstream    string
+	upstreamKey string
+	admin       string
+	client      *http.Client
+	records     chan []any
+	loggerWG    sync.WaitGroup
+	dropped     atomic.Uint64
+}
+
+func token() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		panic(err)
+	}
+	return hex.EncodeToString(b)
+}
+func hash(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+func openDB(path string) (*sql.DB, error) {
+	db, e := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
+	if e != nil {
+		return nil, e
+	}
+	db.SetMaxOpenConns(1)
+	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,prefix TEXT NOT NULL,created TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,key_id INTEGER NOT NULL REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
+ CREATE INDEX IF NOT EXISTS requests_time ON requests(time); CREATE INDEX IF NOT EXISTS requests_key ON requests(key_id);`)
+	return db, e
+}
+func reply(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
+}
+func fail(w http.ResponseWriter, status int, msg string) {
+	reply(w, status, map[string]any{"error": map[string]string{"message": msg, "type": "proxy_error"}})
+}
+func (a *App) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/", a.proxy)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if a.db.Ping() != nil {
+			fail(w, 503, "database unavailable")
+			return
+		}
+		reply(w, 200, map[string]string{"status": "ok"})
+	})
+	mux.HandleFunc("/admin/", a.adminAPI)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(page)
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+		mux.ServeHTTP(w, r)
+	})
+}
+func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
+	if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), []byte(a.admin)) != 1 {
+		fail(w, 401, "administrator token required")
+		return
+	}
+	if r.Method == "POST" && r.Header.Get("Content-Type") != "application/json" {
+		fail(w, 415, "application/json required")
+		return
+	}
+	switch {
+	case r.URL.Path == "/admin/status" && r.Method == "GET":
+		reply(w, 200, map[string]any{"dropped_records": a.dropped.Load(), "queued_records": len(a.records)})
+	case r.URL.Path == "/admin/keys" && r.Method == "GET":
+		a.query(w, `SELECT id,name,prefix,created,revoked FROM keys ORDER BY id DESC`)
+	case r.URL.Path == "/admin/keys" && r.Method == "POST":
+		var v struct {
+			Name string `json:"name"`
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || len(strings.TrimSpace(v.Name)) == 0 || len(v.Name) > 100 {
+			fail(w, 400, "name must contain 1–100 characters")
+			return
+		}
+		k := "mm_" + token()
+		res, e := a.db.Exec(`INSERT INTO keys(name,hash,prefix,created) VALUES(?,?,?,?)`, strings.TrimSpace(v.Name), hash(k), k[:11], time.Now().UTC().Format(time.RFC3339))
+		if e != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		id, _ := res.LastInsertId()
+		reply(w, 201, map[string]any{"id": id, "key": k})
+	case r.URL.Path == "/admin/revoke" && r.Method == "POST":
+		var v struct {
+			ID int64 `json:"id"`
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil {
+			fail(w, 400, "invalid id")
+			return
+		}
+		res, e := a.db.Exec(`UPDATE keys SET revoked=1 WHERE id=?`, v.ID)
+		if e != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			fail(w, 404, "key not found")
+			return
+		}
+		reply(w, 200, map[string]bool{"ok": true})
+	case r.URL.Path == "/admin/usage" && r.Method == "GET":
+		where, args := filters(r)
+		a.query(w, `SELECT k.id AS key_id,k.name,r.model,count(*) AS requests,sum(CASE WHEN r.status>=400 OR r.outcome!='complete' THEN 1 ELSE 0 END) AS errors,sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.cached_tokens) AS cached_tokens,sum(CASE WHEN r.input_tokens IS NULL THEN 1 ELSE 0 END) AS unmetered,round(avg(r.duration_ms)) AS avg_ms FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where+` GROUP BY k.id,r.model ORDER BY requests DESC`, args...)
+	case r.URL.Path == "/admin/requests" && r.Method == "GET":
+		where, args := filters(r)
+		a.query(w, `SELECT r.*,k.name AS key_name FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY r.id DESC LIMIT 200`, args...)
+	default:
+		http.NotFound(w, r)
+	}
+}
+func filters(r *http.Request) (string, []any) {
+	s := "1=1"
+	args := []any{}
+	for _, v := range []struct{ param, col string }{{"key", "r.key_id"}, {"model", "r.model"}} {
+		if x := r.URL.Query().Get(v.param); x != "" {
+			s += " AND " + v.col + "=?"
+			args = append(args, x)
+		}
+	}
+	if x := r.URL.Query().Get("since"); x != "" {
+		s += " AND julianday(r.time)>=julianday(?)"
+		args = append(args, x)
+	}
+	return s, args
+}
+func (a *App) query(w http.ResponseWriter, q string, args ...any) {
+	rows, e := a.db.Query(q, args...)
+	if e != nil {
+		fail(w, 500, "database error")
+		return
+	}
+	defer rows.Close()
+	cols, _ := rows.Columns()
+	out := []map[string]any{}
+	for rows.Next() {
+		values := make([]any, len(cols))
+		ptr := make([]any, len(cols))
+		for i := range values {
+			ptr[i] = &values[i]
+		}
+		if rows.Scan(ptr...) != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		m := map[string]any{}
+		for i, k := range cols {
+			m[k] = values[i]
+		}
+		out = append(out, m)
+	}
+	if rows.Err() != nil {
+		fail(w, 500, "database error")
+		return
+	}
+	reply(w, 200, out)
+}
+
+type Meter struct {
+	Input    *int64
+	Output   *int64
+	Cached   *int64
+	Model    string
+	buf      []byte
+	SSE      bool
+	overflow bool
+}
+
+func (m *Meter) parse(b []byte) {
+	var v struct {
+		Model string `json:"model"`
+		Usage *struct {
+			Prompt        *int64 `json:"prompt_tokens"`
+			Completion    *int64 `json:"completion_tokens"`
+			Input         *int64 `json:"input_tokens"`
+			Output        *int64 `json:"output_tokens"`
+			PromptDetails struct {
+				Cached *int64 `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			InputDetails struct {
+				Cached *int64 `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
+		} `json:"usage"`
+		Response json.RawMessage `json:"response"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return
+	}
+	if len(v.Response) > 0 {
+		m.parse(v.Response)
+	}
+	if v.Model != "" && len(v.Model) <= 256 {
+		m.Model = v.Model
+	}
+	if v.Usage != nil {
+		u := v.Usage
+		m.Input = u.Prompt
+		m.Output = u.Completion
+		m.Cached = u.PromptDetails.Cached
+		if u.Input != nil {
+			m.Input = u.Input
+			m.Output = u.Output
+			m.Cached = u.InputDetails.Cached
+		}
+	}
+}
+func (m *Meter) Write(p []byte) (int, error) {
+	n := len(p)
+	if !m.SSE {
+		if len(m.buf)+n <= 8<<20 {
+			m.buf = append(m.buf, p...)
+		} else {
+			m.overflow = true
+			m.buf = nil
+		}
+		return n, nil
+	}
+	for _, c := range p {
+		if c == '\n' {
+			if !m.overflow {
+				line := bytes.TrimSpace(m.buf)
+				if bytes.HasPrefix(line, []byte("data:")) {
+					m.parse(bytes.TrimSpace(line[5:]))
+				}
+			}
+			m.buf = nil
+			m.overflow = false
+		} else if !m.overflow {
+			if len(m.buf) < 8<<20 {
+				m.buf = append(m.buf, c)
+			} else {
+				m.buf = nil
+				m.overflow = true
+			}
+		}
+	}
+	return n, nil
+}
+func (m *Meter) finish() {
+	if !m.SSE && !m.overflow {
+		m.parse(m.buf)
+	}
+}
+func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
+	var id int64
+	if a.db.QueryRow(`SELECT id FROM keys WHERE hash=? AND revoked=0`, hash(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))).Scan(&id) != nil {
+		fail(w, 401, "valid proxy key required")
+		return
+	}
+	start := time.Now()
+	status := 502
+	outcome := "upstream_error"
+	m := &Meter{}
+	source, _, _ := net.SplitHostPort(r.RemoteAddr)
+	// Store only a known route label, never query parameters or arbitrary URL content.
+	path := r.URL.Path
+	allowed := map[string]string{"/v1/models": "GET", "/v1/chat/completions": "POST", "/v1/completions": "POST", "/v1/embeddings": "POST", "/v1/responses": "POST"}
+	if _, ok := allowed[path]; !ok {
+		path = "unsupported"
+	}
+	defer func() {
+		record := []any{id, start.UTC().Format(time.RFC3339Nano), m.Model, r.Method, path, source, status, time.Since(start).Milliseconds(), m.Input, m.Output, m.Cached, outcome}
+		select {
+		case a.records <- record:
+		default:
+			a.dropped.Add(1)
+		}
+	}()
+
+	if allowed[r.URL.Path] != r.Method {
+		status = 405
+		outcome = "rejected"
+		fail(w, status, "unsupported endpoint or method")
+		return
+	}
+	body, e := io.ReadAll(http.MaxBytesReader(w, r.Body, 32<<20))
+	if e != nil {
+		status = 413
+		outcome = "rejected"
+		fail(w, status, "request too large")
+		return
+	}
+	if r.Method == "POST" {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(body, &obj) != nil {
+			status = 400
+			outcome = "rejected"
+			fail(w, status, "JSON object required")
+			return
+		}
+		json.Unmarshal(obj["model"], &m.Model)
+		if len(m.Model) > 256 {
+			m.Model = ""
+		}
+		var stream bool
+		json.Unmarshal(obj["stream"], &stream)
+		if stream && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions") {
+			opts := map[string]any{}
+			json.Unmarshal(obj["stream_options"], &opts)
+			if opts == nil {
+				opts = map[string]any{}
+			}
+			opts["include_usage"] = true
+			obj["stream_options"], _ = json.Marshal(opts)
+			body, _ = json.Marshal(obj)
+		}
+	}
+	req, e := http.NewRequestWithContext(r.Context(), r.Method, a.upstream+r.URL.RequestURI(), bytes.NewReader(body))
+	if e != nil {
+		fail(w, 502, "upstream request failed")
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	if a.upstreamKey != "" {
+		req.Header.Set("Authorization", "Bearer "+a.upstreamKey)
+	}
+	res, e := a.client.Do(req)
+	if e != nil {
+		fail(w, 502, "upstream unavailable")
+		return
+	}
+	defer res.Body.Close()
+	status = res.StatusCode
+	m.SSE = strings.Contains(res.Header.Get("Content-Type"), "text/event-stream")
+	for _, k := range []string{"Content-Type", "Retry-After", "X-Request-Id"} {
+		if v := res.Header.Get(k); v != "" {
+			w.Header().Set(k, v)
+		}
+	}
+	w.WriteHeader(status)
+	buf := make([]byte, 32*1024)
+	outcome = "complete"
+	for {
+		n, er := res.Body.Read(buf)
+		if n > 0 {
+			m.Write(buf[:n])
+			if _, ew := w.Write(buf[:n]); ew != nil {
+				outcome = "client_disconnected"
+				break
+			}
+			if m.SSE {
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				outcome = "upstream_read_error"
+			}
+			break
+		}
+	}
+	m.finish()
+}
+func main() {
+	dir := env("DATA_DIR", "data")
+	if e := os.MkdirAll(dir, 0700); e != nil {
+		log.Fatal(e)
+	}
+	adminPath := filepath.Join(dir, "admin-token")
+	b, e := os.ReadFile(adminPath)
+	if os.IsNotExist(e) {
+		b = []byte(token())
+		e = os.WriteFile(adminPath, b, 0600)
+	}
+	if e != nil {
+		log.Fatal(e)
+	}
+	db, e := openDB(filepath.Join(dir, "meter.db"))
+	if e != nil {
+		log.Fatal(e)
+	}
+	defer db.Close()
+	up := strings.TrimRight(env("UPSTREAM_URL", "http://127.0.0.1:8000"), "/")
+	u, e := url.Parse(up)
+	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		log.Fatal("invalid upstream URL")
+	}
+	a := &App{db: db, upstream: up, upstreamKey: os.Getenv("UPSTREAM_API_KEY"), admin: strings.TrimSpace(string(b)), client: &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
+	a.startLogger()
+	defer a.stopLogger()
+	srv := &http.Server{Addr: env("LISTEN_ADDR", ":8001"), Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
+	go func() {
+		log.Printf("Model Meter listening on %s", srv.Addr)
+		if e := srv.ListenAndServe(); e != nil && e != http.ErrServerClosed {
+			log.Fatal(e)
+		}
+	}()
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	<-ch
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if e := srv.Shutdown(ctx); e != nil {
+		fmt.Fprintln(os.Stderr, "shutdown deadline exceeded")
+		os.Exit(1)
+	}
+}
+
+// The request path only performs a non-blocking enqueue. One worker owns batch writes.
+func (a *App) startLogger() {
+	a.records = make(chan []any, 8192)
+	a.loggerWG.Add(1)
+	go func() {
+		defer a.loggerWG.Done()
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		batch := make([][]any, 0, 100)
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			tx, e := a.db.Begin()
+			if e == nil {
+				for _, r := range batch {
+					_, e = tx.Exec(`INSERT INTO requests(key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, r...)
+					if e != nil {
+						break
+					}
+				}
+				if e == nil {
+					e = tx.Commit()
+				} else {
+					tx.Rollback()
+				}
+			}
+			if e != nil {
+				a.dropped.Add(uint64(len(batch)))
+				log.Print("request accounting batch failed; dropped-record counter increased")
+			}
+			batch = batch[:0]
+		}
+		for {
+			select {
+			case r, ok := <-a.records:
+				if !ok {
+					flush()
+					return
+				}
+				batch = append(batch, r)
+				if len(batch) >= 100 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			}
+		}
+	}()
+}
+func (a *App) stopLogger() { close(a.records); a.loggerWG.Wait() }
