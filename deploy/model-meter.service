@@ -1,0 +1,24 @@
+[Unit]
+Description=Model Meter API proxy and dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/model-meter
+ExecStart=%h/model-meter/model-meter
+Environment=LISTEN_ADDR=:8001
+Environment=UPSTREAM_URL=http://127.0.0.1:8000
+Environment=DATA_DIR=%h/model-meter/data
+EnvironmentFile=-%h/model-meter/data/service.env
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=40
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/model-meter/data
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

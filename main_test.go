@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -161,4 +162,64 @@ func TestFullLogQueueDoesNotBlock(t *testing.T) {
 		t.Fatal("missing dropped count")
 	} // Restore a worker for fixture cleanup.
 	a.startLogger()
+}
+
+func TestUserIsolation(t *testing.T) {
+	a, s, _ := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"usage":{"prompt_tokens":2,"completion_tokens":1}}`)
+	})
+	createUser := func(name string) (string, int) {
+		res := call(t, s, "/admin/users", "admin-secret", `{"name":"`+name+`"}`)
+		var v struct {
+			Token string
+			ID    int
+		}
+		json.NewDecoder(res.Body).Decode(&v)
+		if v.Token == "" {
+			t.Fatal("user creation failed")
+		}
+		return v.Token, v.ID
+	}
+	alice, aliceID := createUser("Alice")
+	bob, _ := createUser("Bob")
+	res := call(t, s, "/admin/keys", alice, `{"name":"Alice key","user_id":999}`)
+	var key struct {
+		Key string
+		ID  int
+	}
+	json.NewDecoder(res.Body).Decode(&key)
+	if key.Key == "" {
+		t.Fatal("user key failed")
+	}
+	if call(t, s, "/admin/revoke", bob, `{"id":`+fmt.Sprint(key.ID)+`}`).StatusCode != 404 {
+		t.Fatal("cross-user revoke")
+	}
+	if call(t, s, "/admin/key-update", bob, `{"id":`+fmt.Sprint(key.ID)+`,"name":"stolen"}`).StatusCode != 404 {
+		t.Fatal("cross-user rename")
+	}
+	if call(t, s, "/admin/users", bob, "").StatusCode != 403 {
+		t.Fatal("user can list other users")
+	}
+	res = call(t, s, "/v1/chat/completions", key.Key, `{"model":"test"}`)
+	io.Copy(io.Discard, res.Body)
+	awaitRows(t, a, 1)
+	for _, endpoint := range []string{"keys", "usage", "requests", "timeseries"} {
+		res = call(t, s, "/admin/"+endpoint+"?user="+fmt.Sprint(aliceID), bob, "")
+		body, _ := io.ReadAll(res.Body)
+		if strings.TrimSpace(string(body)) != "[]" {
+			t.Fatalf("cross-user %s: %s", endpoint, body)
+		}
+	}
+	if call(t, s, "/admin/profile", alice, `{"name":"Alice new"}`).StatusCode != 200 {
+		t.Fatal("profile update")
+	}
+	if call(t, s, "/admin/users/update", "admin-secret", `{"id":`+fmt.Sprint(aliceID)+`,"disabled":true}`).StatusCode != 200 {
+		t.Fatal("disable failed")
+	}
+	if call(t, s, "/v1/models", key.Key, "").StatusCode != 401 {
+		t.Fatal("disabled user's key accepted")
+	}
+	if call(t, s, "/admin/me", alice, "").StatusCode != 401 {
+		t.Fatal("disabled login accepted")
+	}
 }

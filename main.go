@@ -60,8 +60,9 @@ func openDB(path string) (*sql.DB, error) {
 	if e != nil {
 		return nil, e
 	}
-	db.SetMaxOpenConns(1)
-	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,prefix TEXT NOT NULL,created TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
+	db.SetMaxOpenConns(8)
+	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,prefix TEXT NOT NULL,created TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
  CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,key_id INTEGER NOT NULL REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
  CREATE INDEX IF NOT EXISTS requests_time ON requests(time); CREATE INDEX IF NOT EXISTS requests_key ON requests(key_id);`)
 	return db, e
@@ -101,29 +102,147 @@ func (a *App) handler() http.Handler {
 	})
 }
 func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
-	if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")), []byte(a.admin)) != 1 {
-		fail(w, 401, "administrator token required")
+	credential := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	admin := subtle.ConstantTimeCompare([]byte(credential), []byte(a.admin)) == 1
+	var userID int64
+	var userName string
+	if !admin {
+		if a.db.QueryRow(`SELECT id,name FROM users WHERE hash=? AND disabled=0`, hash(credential)).Scan(&userID, &userName) != nil {
+			fail(w, 401, "valid dashboard token required")
+			return
+		}
+	}
+	scope := "1=1"
+	scopeArgs := []any{}
+	if !admin {
+		scope = "k.user_id=?"
+		scopeArgs = append(scopeArgs, userID)
+	}
+	scopedFilters := func() (string, []any) {
+		where, args := filters(r)
+		return where + " AND " + scope, append(args, scopeArgs...)
+	}
+	if strings.HasPrefix(r.URL.Path, "/admin/users") && !admin {
+		fail(w, 403, "administrator access required")
 		return
 	}
+
 	if r.Method == "POST" && r.Header.Get("Content-Type") != "application/json" {
 		fail(w, 415, "application/json required")
 		return
 	}
 	switch {
+	case r.URL.Path == "/admin/me" && r.Method == "GET":
+		reply(w, 200, map[string]any{"admin": admin, "id": userID, "name": userName})
+	case r.URL.Path == "/admin/profile" && r.Method == "POST":
+		var v struct{ Name string }
+		if admin {
+			fail(w, 400, "administrator has no user profile")
+			return
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || strings.TrimSpace(v.Name) == "" || len(v.Name) > 100 {
+			fail(w, 400, "valid name required")
+			return
+		}
+		if _, e := a.db.Exec(`UPDATE users SET name=? WHERE id=?`, strings.TrimSpace(v.Name), userID); e != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		reply(w, 200, map[string]bool{"ok": true})
+	case r.URL.Path == "/admin/users" && r.Method == "GET":
+		a.query(w, `SELECT id,name,disabled,created FROM users ORDER BY id DESC`)
+	case r.URL.Path == "/admin/users" && r.Method == "POST":
+		var v struct{ Name string }
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || strings.TrimSpace(v.Name) == "" || len(v.Name) > 100 {
+			fail(w, 400, "valid name required")
+			return
+		}
+		secret := "mu_" + token()
+		res, e := a.db.Exec(`INSERT INTO users(name,hash,created) VALUES(?,?,?)`, strings.TrimSpace(v.Name), hash(secret), time.Now().UTC().Format(time.RFC3339))
+		if e != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		id, _ := res.LastInsertId()
+		reply(w, 201, map[string]any{"id": id, "token": secret})
+	case r.URL.Path == "/admin/users/update" && r.Method == "POST":
+		var v struct {
+			ID       int64
+			Disabled bool
+			Name     string
+			Rotate   bool
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || v.ID == 0 || len(v.Name) > 100 {
+			fail(w, 400, "valid user required")
+			return
+		}
+		secret := ""
+		var res sql.Result
+		var e error
+		if v.Rotate {
+			secret = "mu_" + token()
+			res, e = a.db.Exec(`UPDATE users SET hash=? WHERE id=?`, hash(secret), v.ID)
+		} else {
+			res, e = a.db.Exec(`UPDATE users SET disabled=?,name=CASE WHEN ?='' THEN name ELSE ? END WHERE id=?`, v.Disabled, strings.TrimSpace(v.Name), strings.TrimSpace(v.Name), v.ID)
+		}
+		if e != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			fail(w, 404, "user not found")
+			return
+		}
+		reply(w, 200, map[string]any{"ok": true, "token": secret})
+	case r.URL.Path == "/admin/key-update" && r.Method == "POST":
+		var v struct {
+			ID   int64
+			Name string
+		}
+		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || strings.TrimSpace(v.Name) == "" || len(v.Name) > 100 {
+			fail(w, 400, "valid name required")
+			return
+		}
+		res, e := a.db.Exec(`UPDATE keys AS k SET name=? WHERE id=? AND `+scope, append([]any{strings.TrimSpace(v.Name), v.ID}, scopeArgs...)...)
+		if e != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			fail(w, 404, "key not found")
+			return
+		}
+		reply(w, 200, map[string]bool{"ok": true})
+	case r.URL.Path == "/admin/timeseries" && r.Method == "GET":
+		where, args := scopedFilters()
+		a.query(w, `SELECT strftime('%Y-%m-%dT%H:%M:00Z',r.time) AS time,count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens,round(avg(duration_ms)) AS avg_ms FROM requests r JOIN keys k ON k.id=r.key_id WHERE julianday(r.time)>=julianday('now','-1 hour') AND `+where+` GROUP BY 1 ORDER BY 1`, args...)
 	case r.URL.Path == "/admin/status" && r.Method == "GET":
 		reply(w, 200, map[string]any{"dropped_records": a.dropped.Load(), "queued_records": len(a.records)})
 	case r.URL.Path == "/admin/keys" && r.Method == "GET":
-		a.query(w, `SELECT id,name,prefix,created,revoked FROM keys ORDER BY id DESC`)
+		a.query(w, `SELECT k.id,k.name,k.prefix,k.created,k.revoked,k.user_id,u.name AS user_name FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE `+scope+` ORDER BY k.id DESC`, scopeArgs...)
 	case r.URL.Path == "/admin/keys" && r.Method == "POST":
 		var v struct {
-			Name string `json:"name"`
+			Name   string `json:"name"`
+			UserID *int64 `json:"user_id"`
 		}
 		if json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&v) != nil || len(strings.TrimSpace(v.Name)) == 0 || len(v.Name) > 100 {
 			fail(w, 400, "name must contain 1–100 characters")
 			return
 		}
+		if !admin {
+			v.UserID = &userID
+		}
+		if v.UserID != nil {
+			var valid int
+			if a.db.QueryRow(`SELECT id FROM users WHERE id=? AND disabled=0`, *v.UserID).Scan(&valid) != nil {
+				fail(w, 400, "active user required")
+				return
+			}
+		}
 		k := "mm_" + token()
-		res, e := a.db.Exec(`INSERT INTO keys(name,hash,prefix,created) VALUES(?,?,?,?)`, strings.TrimSpace(v.Name), hash(k), k[:11], time.Now().UTC().Format(time.RFC3339))
+		res, e := a.db.Exec(`INSERT INTO keys(user_id,name,hash,prefix,created) VALUES(?,?,?,?,?)`, v.UserID, strings.TrimSpace(v.Name), hash(k), k[:11], time.Now().UTC().Format(time.RFC3339))
 		if e != nil {
 			fail(w, 500, "database error")
 			return
@@ -138,7 +257,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, "invalid id")
 			return
 		}
-		res, e := a.db.Exec(`UPDATE keys SET revoked=1 WHERE id=?`, v.ID)
+		res, e := a.db.Exec(`UPDATE keys AS k SET revoked=1 WHERE id=? AND `+scope, append([]any{v.ID}, scopeArgs...)...)
 		if e != nil {
 			fail(w, 500, "database error")
 			return
@@ -150,10 +269,10 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/admin/usage" && r.Method == "GET":
-		where, args := filters(r)
-		a.query(w, `SELECT k.id AS key_id,k.name,r.model,count(*) AS requests,sum(CASE WHEN r.status>=400 OR r.outcome!='complete' THEN 1 ELSE 0 END) AS errors,sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.cached_tokens) AS cached_tokens,sum(CASE WHEN r.input_tokens IS NULL THEN 1 ELSE 0 END) AS unmetered,round(avg(r.duration_ms)) AS avg_ms FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where+` GROUP BY k.id,r.model ORDER BY requests DESC`, args...)
+		where, args := scopedFilters()
+		a.query(w, `SELECT k.id AS key_id,k.name,k.user_id,(SELECT name FROM users WHERE id=k.user_id) AS user_name,r.model,count(*) AS requests,sum(CASE WHEN r.status>=400 OR r.outcome!='complete' THEN 1 ELSE 0 END) AS errors,sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.cached_tokens) AS cached_tokens,sum(CASE WHEN r.input_tokens IS NULL THEN 1 ELSE 0 END) AS unmetered,round(avg(r.duration_ms)) AS avg_ms FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where+` GROUP BY k.id,r.model ORDER BY requests DESC`, args...)
 	case r.URL.Path == "/admin/requests" && r.Method == "GET":
-		where, args := filters(r)
+		where, args := scopedFilters()
 		a.query(w, `SELECT r.*,k.name AS key_name FROM requests r JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY r.id DESC LIMIT 200`, args...)
 	default:
 		http.NotFound(w, r)
@@ -162,7 +281,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 func filters(r *http.Request) (string, []any) {
 	s := "1=1"
 	args := []any{}
-	for _, v := range []struct{ param, col string }{{"key", "r.key_id"}, {"model", "r.model"}} {
+	for _, v := range []struct{ param, col string }{{"key", "r.key_id"}, {"model", "r.model"}, {"user", "k.user_id"}} {
 		if x := r.URL.Query().Get(v.param); x != "" {
 			s += " AND " + v.col + "=?"
 			args = append(args, x)
@@ -293,7 +412,7 @@ func (m *Meter) finish() {
 }
 func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	var id int64
-	if a.db.QueryRow(`SELECT id FROM keys WHERE hash=? AND revoked=0`, hash(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))).Scan(&id) != nil {
+	if a.db.QueryRow(`SELECT k.id FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.user_id IS NULL OR u.disabled=0)`, hash(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))).Scan(&id) != nil {
 		fail(w, 401, "valid proxy key required")
 		return
 	}
