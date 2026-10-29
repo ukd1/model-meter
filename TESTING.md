@@ -9,3 +9,20 @@
 - User systemd service enabled and active on port 8001. Existing user linger is enabled. Restart verified: four request records persisted, health endpoint returned OK, zero dropped accounting records, test key revocations and disabled user state survived.
 
 No inference bodies or credentials are included in this report or committed to Git.
+
+## DS4 protocol compatibility update — 2026-10-29
+
+Inspected DS4's HTTP route dispatch and usage serializers. Added Anthropic Messages and individual model lookup; verified the existing OpenAI Responses, Chat Completions, and legacy Completions paths.
+
+- `go test -race ./...`, `go vet ./...`, and build passed after implementation.
+- Added tests for Anthropic JSON/SSE passthrough, partial and cumulative usage snapshots, cache-read/cache-write normalization, Responses JSON/SSE envelopes, credential replacement, protocol headers, private-header exclusion, conflicting credentials, revoked `x-api-key` authentication, and model-route log normalization.
+- `python3 tests/protocol_smoke.py` passed against the actual DS4 upstream through the deployed service. Model list and individual model lookup both succeeded.
+
+| Endpoint | JSON input/output | Stream input/output | JSON / stream duration |
+| --- | --- | --- | --- |
+| `/v1/messages` | 33 / 4 | 33 / 4 | 1,280 / 1,111 ms |
+| `/v1/responses` | 33 / 4 | 33 / 4 | 1,107 / 1,168 ms |
+| `/v1/chat/completions` | 33 / 4 | 33 / 4 | 1,211 / 1,199 ms |
+| `/v1/completions` | 36 / 4 | 36 / 4 | 1,432 / 1,273 ms |
+
+All eight inference records matched the upstream's usage after normalization. These durations include inference and are not proxy-overhead measurements. Test credentials were revoked; request metadata remains as verification history. The service is active on port 8001. This verifies Anthropic protocol compatibility with DS4, not a deployment against Anthropic's hosted service.
