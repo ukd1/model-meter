@@ -67,7 +67,7 @@ Persisted request fields: key ID, UTC start time, model, method, known endpoint 
 
 Completed metadata enters a bounded **8192-record queue without waiting**. A background writer commits SQLite batches every 250 ms or 100 records. WAL with a connection pool lets authentication reads run alongside accounting writes. Graceful shutdown drains handlers and the queue. Crashes can lose queued records; a full queue or failed transaction drops accounting records instead of blocking responses. The dashboard warns about dropped records, and `/admin/status` exposes `dropped_records` and `queued_records` (dropped count resets on restart). This is usage monitoring, not billing-grade accounting.
 
-Totals use upstream-reported usage. Missing usage is NULL and shown as unmetered, never estimated. Interrupted streams may lack final usage. Cached tokens are included in input totals. Metadata persists indefinitely; back up SQLite with its backup API or while the service is stopped. The live charts show one-minute buckets for the past hour, refresh every 15 seconds, and honor selected filters. Recent requests are limited to the latest 200; aggregates cover all matching history.
+Totals use upstream-reported usage. Missing usage is NULL and shown as unmetered, never estimated. Interrupted streams may lack final usage. Cached tokens are included in input totals. Metadata persists indefinitely; back up SQLite with its backup API or while the service is stopped. The live charts show one-minute buckets for the past hour and honor selected filters. Completed accounting batches and account/key changes trigger live updates through an authenticated Server-Sent Events connection; the browser does not poll for data. Recent requests are limited to the latest 200; aggregates cover all matching history.
 
 Request bodies are limited to 32 MiB; metering inspection buffers are limited to 8 MiB per JSON response/SSE line. Oversized or unrecognized usage envelopes are unmetered. Requests have a 30-minute upstream deadline. The service records authenticated requests; rejected authentication is not attributed to a key. Existing in-flight requests can finish after a key is revoked.
 
@@ -98,9 +98,19 @@ The installed unit is in `~/.config/systemd/user/model-meter.service`; the repos
 
 The local deployment uses HTTP, like the existing upstream. Use a trusted network or SSH tunnel (`ssh -L 8001:localhost:8001 <user>@<server>`) for access; terminate TLS before exposing it to an untrusted network. Forwarded IP headers are deliberately not trusted. No external frontend dependencies, fonts, or analytics are loaded.
 
+## Live dashboard
+
+The interface separates Overview, Requests, and Access. It uses local fonts, a minimal terminal-inspired green/violet palette, and reduced-motion-aware effects; all frontend assets are embedded in the Go binary.
+
+`GET /admin/events` opens an authenticated SSE stream. The browser supplies its token in the Authorization header, not in a URL or browser storage. On a committed usage batch or account/key change, the server sends a notification and the browser reloads its authorized view. Changes are coalesced into a bounded one-slot notification queue per connection. A slow dashboard cannot block accounting writes or inference responses.
+
+Users receive notifications only for their own activity; administrators receive all activity. User access is revalidated before notifications and 15-second keepalive heartbeats. Disabling a user or resetting their sign-in token closes their live session. Network interruptions trigger reconnect with backoff and a fresh snapshot to recover missed changes. Heartbeats keep the stream alive and advance chart axes locally; they do not trigger periodic data fetches. Aggregate totals reflect the last snapshot; manual Sync and filter changes also fetch a fresh view. Usage appears when a request finishes and its metadata batch commits, not token by token during inference.
+
+If placing another reverse proxy in front, disable response buffering for `/admin/events` and permit long-lived HTTP streams. The service sends `X-Accel-Buffering: no` and bounds each stream write with a deadline. Graceful service shutdown closes dashboard streams before draining inference handlers.
+
 ## Browser verification
 
-`tests/browser.cjs` exercises the deployed dashboard with Playwright. It creates a QA user/key, tests both roles, checks graphs and mobile sizing, then revokes the key and disables the user. It requires Node 20+ and Playwright with Chromium installed; supply `NODE_PATH` if Playwright is installed outside this repository. `TEST_URL` and `ADMIN_TOKEN_FILE` override its defaults. It writes screenshots under `/tmp`, without full credentials visible.
+`tests/browser.cjs` exercises the deployed dashboard with Playwright. It creates a QA user/key, tests both roles, checks graphs and mobile sizing, verifies pushed updates without idle polling, exercises network reconnection and cross-session key changes, then revokes the key and confirms that disabling the user closes their active session. It requires Node 20+ and Playwright with Chromium installed; supply `NODE_PATH` if Playwright is installed outside this repository. `TEST_URL` and `ADMIN_TOKEN_FILE` override its defaults. It writes screenshots under `/tmp`, without full credentials visible.
 
 Streaming usage follows the [OpenAI streaming event format](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events).
 

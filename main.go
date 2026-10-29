@@ -30,6 +30,12 @@ import (
 //go:embed index.html
 var page []byte
 
+//go:embed dashboard.js
+var dashboardJS []byte
+
+//go:embed dashboard.css
+var dashboardCSS []byte
+
 type App struct {
 	db          *sql.DB
 	upstream    string
@@ -39,6 +45,7 @@ type App struct {
 	records     chan []any
 	loggerWG    sync.WaitGroup
 	dropped     atomic.Uint64
+	live        liveHub
 }
 
 func token() string {
@@ -78,6 +85,14 @@ func fail(w http.ResponseWriter, status int, msg string) {
 func (a *App) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/", a.proxy)
+	mux.HandleFunc("GET /dashboard.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		w.Write(dashboardJS)
+	})
+	mux.HandleFunc("GET /dashboard.css", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Write(dashboardCSS)
+	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if a.db.Ping() != nil {
 			fail(w, 503, "database unavailable")
@@ -97,7 +112,7 @@ func (a *App) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
 		mux.ServeHTTP(w, r)
 	})
 }
@@ -132,6 +147,8 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.URL.Path == "/admin/events" && r.Method == "GET":
+		a.liveEvents(w, r, userID, admin, credential)
 	case r.URL.Path == "/admin/me" && r.Method == "GET":
 		reply(w, 200, map[string]any{"admin": admin, "id": userID, "name": userName})
 	case r.URL.Path == "/admin/profile" && r.Method == "POST":
@@ -148,6 +165,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, "database error")
 			return
 		}
+		a.notifyUser(userID)
 		reply(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/admin/users" && r.Method == "GET":
 		a.query(w, `SELECT id,name,disabled,created FROM users ORDER BY id DESC`)
@@ -164,6 +182,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id, _ := res.LastInsertId()
+		a.notifyUser(id)
 		reply(w, 201, map[string]any{"id": id, "token": secret})
 	case r.URL.Path == "/admin/users/update" && r.Method == "POST":
 		var v struct {
@@ -194,6 +213,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 404, "user not found")
 			return
 		}
+		a.notifyUser(v.ID)
 		reply(w, 200, map[string]any{"ok": true, "token": secret})
 	case r.URL.Path == "/admin/key-update" && r.Method == "POST":
 		var v struct {
@@ -214,6 +234,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 404, "key not found")
 			return
 		}
+		a.notifyKeys(v.ID)
 		reply(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/admin/timeseries" && r.Method == "GET":
 		where, args := scopedFilters()
@@ -248,6 +269,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id, _ := res.LastInsertId()
+		a.notifyKeys(id)
 		reply(w, 201, map[string]any{"id": id, "key": k})
 	case r.URL.Path == "/admin/revoke" && r.Method == "POST":
 		var v struct {
@@ -267,6 +289,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 404, "key not found")
 			return
 		}
+		a.notifyKeys(v.ID)
 		reply(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/admin/usage" && r.Method == "GET":
 		where, args := scopedFilters()
@@ -657,6 +680,7 @@ func main() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	<-ch
+	a.live.close()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if e := srv.Shutdown(ctx); e != nil {
@@ -695,6 +719,19 @@ func (a *App) startLogger() {
 			if e != nil {
 				a.dropped.Add(uint64(len(batch)))
 				log.Print("request accounting batch failed; dropped-record counter increased")
+			}
+			if e == nil {
+				ids := make([]any, 0, len(batch))
+				seen := map[any]bool{}
+				for _, record := range batch {
+					if !seen[record[0]] {
+						seen[record[0]] = true
+						ids = append(ids, record[0])
+					}
+				}
+				a.notifyKeys(ids...)
+			} else {
+				a.live.notify(nil)
 			}
 			batch = batch[:0]
 		}
