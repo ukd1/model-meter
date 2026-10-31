@@ -81,6 +81,18 @@ Totals use upstream-reported usage. Missing usage is NULL and shown as unmetered
 
 Request bodies are limited to 32 MiB; metering inspection buffers are limited to 8 MiB per JSON response/SSE line. Oversized or unrecognized usage envelopes are unmetered. Requests have a 30-minute upstream deadline. The service records authenticated requests and, when enabled, anonymous requests with no key ID; rejected authentication is not recorded as anonymous traffic. Existing in-flight requests can finish after a key is revoked.
 
+## MCP agent management
+
+An optional stateless Streamable HTTP endpoint at /mcp lets agents manage inference keys and retrieve windowed usage/performance statistics. Enable it privately with MCP_ADMIN_TOKEN (at least 32 random characters) and MCP_ADMIN_USERNAME (an existing active administrator). Without both settings, the endpoint returns 404. Ordinary inference keys and dashboard cookies cannot authorize it. Disabling or demoting the configured administrator immediately blocks access.
+
+Configure a compatible MCP client with your gateway URL plus /mcp and Authorization: Bearer <management-token>. For example, use https://meter.example.test/mcp. The management credential grants administrator access to all users' keys and statistics; keep it outside version control. Explicit bearer-header clients are supported; OAuth discovery and interactive sign-in are not implemented.
+
+Tools: list_users; list_keys (optional include_revoked); create_key (user_id, name, returns the secret once); revoke_key (key_id, retains history); get_stats (optional window, user_id, key_id, model). Windows are 1m, 5m, 15m, 1h (default), 4h, 12h, 24h, 7d, 30d or all. Missing usage remains unmetered. Newly created key secrets must be handled privately.
+
+Requests use Content-Type: application/json and Accept: application/json, text/event-stream. Initialize, ping, tools/list, tools/call and initialization notifications are supported; replies are JSON. Supported protocol versions are 2025-03-26, 2025-06-18 and 2025-11-25. The optional standalone GET event stream is not offered. Cross-origin browser requests are rejected.
+
+Revoked keys are hidden from the default management table and selector. Their records and usage remain available for reporting; an explicit authorized GET /admin/keys?include_revoked=true returns the audit list. No historical records are deleted.
+
 ## Operate
 
 ```sh

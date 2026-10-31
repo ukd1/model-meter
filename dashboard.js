@@ -101,7 +101,7 @@ function renderUsers(users) {
   if (identity.id && lastProfileName !== identity.name) { $('profileName').value = identity.name; lastProfileName = identity.name; }
   if (!identity.admin) return;
   selectOptions('userFilter', users, u => u.name, 'All users');
-  selectOptions('keyOwner', users.filter(u => !u.disabled), u => u.name, 'Administrator');
+  selectOptions('keyOwner', users.filter(u => !u.disabled), u => u.name, identity.name || identity.username);
   if (!changed('userRows', users)) return;
   users.forEach(u => {
     const tr = row('userRows', [u.name, u.admin ? 'Administrator' : 'User', u.disabled ? 'Disabled' : 'Active', date(u.created)]), target = actions(tr);

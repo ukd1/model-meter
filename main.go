@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	_ "embed"
 	"encoding/hex"
@@ -13,12 +14,15 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +52,7 @@ type App struct {
 	settingsOnce   sync.Once
 	settingsErr    error
 	settingsMu     sync.Mutex
+	modelAliases   map[string]string
 }
 
 func token() string {
@@ -88,6 +93,23 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, e
 	}
+	for _, column := range []struct{ name, definition string }{
+		{"allowed_routes", "TEXT NOT NULL DEFAULT '[]'"},
+		{"allowed_models", "TEXT NOT NULL DEFAULT '[]'"},
+		{"expires", "TEXT"},
+	} {
+		var present int
+		if e = db.QueryRow("SELECT count(*) FROM pragma_table_info('keys') WHERE name=?", column.name).Scan(&present); e != nil {
+			db.Close()
+			return nil, e
+		}
+		if present == 0 {
+			if _, e = db.Exec("ALTER TABLE keys ADD COLUMN " + column.name + " " + column.definition); e != nil {
+				db.Close()
+				return nil, e
+			}
+		}
+	}
 	for _, column := range []string{"username", "password_hash"} {
 		var exists int
 		if e = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('users') WHERE name=?`, column).Scan(&exists); e != nil {
@@ -125,6 +147,7 @@ func (a *App) handler() http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fail(w, 503, "proxy settings unavailable") })
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/mcp", a.mcpHTTP)
 	mux.HandleFunc("/v1/", a.proxy)
 	mux.HandleFunc("GET /dashboard.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
@@ -160,6 +183,9 @@ func (a *App) handler() http.Handler {
 }
 func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 	identity, err := a.authenticate(r)
+	if trusted, ok := r.Context().Value(mcpIdentityKey{}).(dashboardIdentity); ok {
+		identity, err = trusted, nil
+	}
 	if err != nil {
 		fail(w, 401, "sign-in required")
 		return
@@ -339,7 +365,11 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/admin/status" && r.Method == "GET":
 		reply(w, 200, map[string]any{"dropped_records": a.dropped.Load(), "queued_records": len(a.records)})
 	case r.URL.Path == "/admin/keys" && r.Method == "GET":
-		a.query(w, `SELECT k.id,k.name,k.prefix,k.created,k.revoked,k.user_id,u.name AS user_name FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE `+scope+` ORDER BY k.id DESC`, scopeArgs...)
+		keyScope := scope
+		if r.URL.Query().Get("include_revoked") != "true" {
+			keyScope += " AND k.revoked=0"
+		}
+		a.query(w, `SELECT k.id,k.name,k.prefix,k.created,k.revoked,k.user_id,u.name AS user_name FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE `+keyScope+` ORDER BY k.id DESC`, scopeArgs...)
 	case r.URL.Path == "/admin/keys" && r.Method == "POST":
 		var v struct {
 			Name   string `json:"name"`
@@ -349,7 +379,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, "name must contain 1–100 characters")
 			return
 		}
-		if !admin {
+		if !admin || v.UserID == nil {
 			v.UserID = &userID
 		}
 		if v.UserID != nil {
@@ -591,6 +621,21 @@ func proxyRoute(path string) (label, method string) {
 	return "unsupported", ""
 }
 
+func allowedValue(raw, value string) bool {
+	var values []string
+	if json.Unmarshal([]byte(raw), &values) != nil {
+		return false
+	}
+	if len(values) == 0 {
+		return true
+	}
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
 func (m *Meter) Write(p []byte) (int, error) {
 	n := len(p)
 	if !m.SSE {
@@ -630,11 +675,12 @@ func (m *Meter) finish() {
 }
 func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	var keyID any
+	var allowedRoutes, allowedModels = "[]", "[]"
 	missingCredential := len(r.Header.Values("Authorization")) == 0 && len(r.Header.Values("X-Api-Key")) == 0
 	if !missingCredential || !a.allowAnonymous.Load() {
 		var id int64
 		credential := proxyCredential(r)
-		if credential == "" || a.db.QueryRow(`SELECT k.id FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.user_id IS NULL OR u.disabled=0)`, hash(credential)).Scan(&id) != nil {
+		if credential == "" || a.db.QueryRow(`SELECT k.id,k.allowed_routes,k.allowed_models FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.expires IS NULL OR julianday(k.expires)>julianday('now')) AND (k.user_id IS NULL OR u.disabled=0)`, hash(credential)).Scan(&id, &allowedRoutes, &allowedModels) != nil {
 			fail(w, 401, "valid proxy key required")
 			return
 		}
@@ -656,6 +702,11 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	if !allowedValue(allowedRoutes, r.URL.Path) {
+		status, outcome = 403, "rejected"
+		fail(w, status, "endpoint not permitted for this key")
+		return
+	}
 	if method != r.Method {
 		status = 405
 		outcome = "rejected"
@@ -678,6 +729,16 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		json.Unmarshal(obj["model"], &m.Model)
+		if !allowedValue(allowedModels, m.Model) {
+			status, outcome = 403, "rejected"
+			fail(w, status, "model not permitted for this key")
+			return
+		}
+		if mapped, ok := a.modelAliases[m.Model]; ok {
+			obj["model"], _ = json.Marshal(mapped)
+			body, _ = json.Marshal(obj)
+			m.Model = mapped
+		}
 		if len(m.Model) > 256 {
 			m.Model = ""
 		}
@@ -783,6 +844,9 @@ func main() {
 		log.Fatal("invalid upstream URL")
 	}
 	a := &App{db: db, upstream: up, upstreamKey: os.Getenv("UPSTREAM_API_KEY"), client: &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
+	if e := json.Unmarshal([]byte(env("MODEL_ALIASES", "{}")), &a.modelAliases); e != nil {
+		log.Fatal("invalid MODEL_ALIASES JSON")
+	}
 	a.startLogger()
 	defer a.stopLogger()
 	srv := &http.Server{Addr: env("LISTEN_ADDR", ":8000"), Handler: a.handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
@@ -869,3 +933,252 @@ func (a *App) startLogger() {
 	}()
 }
 func (a *App) stopLogger() { close(a.records); a.loggerWG.Wait() }
+
+type mcpIdentityKey struct{}
+
+func (a *App) mcpHTTP(w http.ResponseWriter, r *http.Request) {
+	secret, username := os.Getenv("MCP_ADMIN_TOKEN"), os.Getenv("MCP_ADMIN_USERNAME")
+	if len(secret) < 32 || username == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get("Origin") != "" {
+		clone := r.Clone(r.Context())
+		clone.Header = r.Header.Clone()
+		clone.Header.Set("X-Model-Meter", "dashboard")
+		if !dashboardMutationAllowed(clone) {
+			fail(w, 403, "origin not allowed")
+			return
+		}
+	}
+	auth := r.Header.Get("Authorization")
+	supplied := strings.TrimPrefix(auth, "Bearer ")
+	if len(r.Header.Values("Authorization")) != 1 || !strings.HasPrefix(auth, "Bearer ") || subtle.ConstantTimeCompare([]byte(hash(supplied)), []byte(hash(secret))) != 1 {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="model-meter-mcp"`)
+		fail(w, 401, "MCP administrator token required")
+		return
+	}
+	var actor dashboardIdentity
+	if a.db.QueryRowContext(r.Context(), `SELECT id,name,username,admin FROM users WHERE username=? AND admin=1 AND disabled=0`, username).Scan(&actor.ID, &actor.Name, &actor.Username, &actor.Admin) != nil {
+		fail(w, 403, "active MCP administrator required")
+		return
+	}
+	if r.Method != "POST" {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(405)
+		return
+	}
+	version := r.Header.Get("MCP-Protocol-Version")
+	if version != "" && version != "2025-03-26" && version != "2025-06-18" && version != "2025-11-25" {
+		fail(w, 400, "unsupported protocol version")
+		return
+	}
+	media, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if media != "application/json" {
+		fail(w, 415, "application/json required")
+		return
+	}
+	if !strings.Contains(r.Header.Get("Accept"), "application/json") || !strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+		fail(w, 406, "Accept must include application/json and text/event-stream")
+		return
+	}
+	var m struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384))
+	rpcError := func(code int, text string) {
+		reply(w, 200, map[string]any{"jsonrpc": "2.0", "id": nil, "error": map[string]any{"code": code, "message": text}})
+	}
+	if dec.Decode(&m) != nil {
+		rpcError(-32700, "invalid JSON")
+		return
+	}
+	var trailing any
+	if dec.Decode(&trailing) != io.EOF || m.JSONRPC != "2.0" || m.Method == "" {
+		rpcError(-32600, "invalid request")
+		return
+	}
+	if len(m.ID) == 0 {
+		if m.Method == "notifications/initialized" || m.Method == "notifications/cancelled" {
+			w.WriteHeader(202)
+			return
+		}
+		fail(w, 400, "request id required")
+		return
+	}
+	var id any
+	if json.Unmarshal(m.ID, &id) != nil {
+		rpcError(-32600, "invalid id")
+		return
+	}
+	switch id.(type) {
+	case string, float64:
+	default:
+		rpcError(-32600, "invalid id")
+		return
+	}
+	response := map[string]any{"jsonrpc": "2.0", "id": m.ID}
+	switch m.Method {
+	case "initialize":
+		var p struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		if json.Unmarshal(m.Params, &p) != nil {
+			response["error"] = map[string]any{"code": -32602, "message": "invalid parameters"}
+			break
+		}
+		v := p.ProtocolVersion
+		if v != "2025-03-26" && v != "2025-06-18" && v != "2025-11-25" {
+			v = "2025-06-18"
+		}
+		response["result"] = map[string]any{"protocolVersion": v, "serverInfo": map[string]string{"name": "model-meter", "version": "1.0.0"}, "capabilities": map[string]any{"tools": map[string]any{}}}
+	case "ping":
+		response["result"] = map[string]any{}
+	case "tools/list":
+		integer := map[string]any{"type": "integer", "minimum": 1}
+		tools := []any{}
+		add := func(name, description string, props map[string]any, required ...string) {
+			if required == nil {
+				required = []string{}
+			}
+			tools = append(tools, map[string]any{"name": name, "description": description, "inputSchema": map[string]any{"type": "object", "properties": props, "required": required, "additionalProperties": false}})
+		}
+		add("list_users", "List named users and IDs, without credentials.", map[string]any{})
+		add("list_keys", "List active key metadata. Optionally include revoked keys for audit.", map[string]any{"include_revoked": map[string]any{"type": "boolean"}})
+		add("create_key", "Create an inference key for an active user. The secret is returned once; handle privately.", map[string]any{"user_id": integer, "name": map[string]any{"type": "string", "minLength": 1, "maxLength": 100}}, "user_id", "name")
+		add("revoke_key", "Revoke a key for new requests, retaining historical usage.", map[string]any{"key_id": integer}, "key_id")
+		add("get_stats", "Usage and performance by time window, including revoked history. Optional user/key/model filters.", map[string]any{"window": map[string]any{"type": "string", "enum": []string{"1m", "5m", "15m", "1h", "4h", "12h", "24h", "7d", "30d", "all"}}, "user_id": integer, "key_id": integer, "model": map[string]any{"type": "string", "maxLength": 256}})
+		response["result"] = map[string]any{"tools": tools}
+	case "tools/call":
+		var p struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if json.Unmarshal(m.Params, &p) != nil {
+			response["error"] = map[string]any{"code": -32602, "message": "invalid parameters"}
+			break
+		}
+		value, err := a.mcpCall(r, actor, p.Name, p.Arguments)
+		if err != nil {
+			response["result"] = map[string]any{"content": []any{map[string]any{"type": "text", "text": err.Error()}}, "isError": true}
+			break
+		}
+		encoded, _ := json.Marshal(value)
+		response["result"] = map[string]any{"content": []any{map[string]any{"type": "text", "text": string(encoded)}}, "structuredContent": value, "isError": false}
+	default:
+		response["error"] = map[string]any{"code": -32601, "message": "method not found"}
+	}
+	reply(w, 200, response)
+}
+
+func (a *App) mcpCall(r *http.Request, actor dashboardIdentity, name string, raw json.RawMessage) (map[string]any, error) {
+	if len(raw) == 0 {
+		raw = json.RawMessage("{}")
+	}
+	fields := map[string][]string{"list_users": {}, "list_keys": {"include_revoked"}, "create_key": {"user_id", "name"}, "revoke_key": {"key_id"}, "get_stats": {"window", "user_id", "key_id", "model"}}
+	allowed, ok := fields[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown tool")
+	}
+	var supplied map[string]json.RawMessage
+	if json.Unmarshal(raw, &supplied) != nil || supplied == nil {
+		return nil, fmt.Errorf("arguments must be an object")
+	}
+	for k := range supplied {
+		found := false
+		for _, v := range allowed {
+			if k == v {
+				found = true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("unsupported argument")
+		}
+	}
+	var args struct {
+		UserID         int64  `json:"user_id"`
+		KeyID          int64  `json:"key_id"`
+		Name           string `json:"name"`
+		Window         string `json:"window"`
+		Model          string `json:"model"`
+		IncludeRevoked bool   `json:"include_revoked"`
+	}
+	if json.Unmarshal(raw, &args) != nil || args.UserID < 0 || args.KeyID < 0 || len(args.Model) > 256 {
+		return nil, fmt.Errorf("invalid arguments")
+	}
+	for _, k := range []string{"user_id", "key_id"} {
+		if v, ok := supplied[k]; ok && (string(v) == "null" || (k == "user_id" && args.UserID == 0) || (k == "key_id" && args.KeyID == 0)) {
+			return nil, fmt.Errorf("IDs must be positive integers")
+		}
+	}
+	invoke := func(method, path string, body any) (any, error) {
+		var data []byte
+		if body != nil {
+			data, _ = json.Marshal(body)
+		}
+		req, _ := http.NewRequestWithContext(context.WithValue(r.Context(), mcpIdentityKey{}, actor), method, path, bytes.NewReader(data))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		a.adminAPI(rec, req)
+		if rec.Code >= 400 {
+			return nil, fmt.Errorf("operation rejected (HTTP %d)", rec.Code)
+		}
+		var result any
+		if json.Unmarshal(rec.Body.Bytes(), &result) != nil {
+			return nil, fmt.Errorf("invalid operation result")
+		}
+		return result, nil
+	}
+	switch name {
+	case "list_users":
+		v, e := invoke("GET", "/admin/users", nil)
+		return map[string]any{"users": v}, e
+	case "list_keys":
+		v, e := invoke("GET", "/admin/keys?include_revoked="+strconv.FormatBool(args.IncludeRevoked), nil)
+		return map[string]any{"keys": v}, e
+	case "create_key":
+		if args.UserID <= 0 || strings.TrimSpace(args.Name) == "" || len(args.Name) > 100 {
+			return nil, fmt.Errorf("positive user_id and name (1-100 characters) required")
+		}
+		v, e := invoke("POST", "/admin/keys", map[string]any{"name": args.Name, "user_id": args.UserID})
+		return map[string]any{"created": v}, e
+	case "revoke_key":
+		if args.KeyID <= 0 {
+			return nil, fmt.Errorf("positive key_id required")
+		}
+		v, e := invoke("POST", "/admin/revoke", map[string]any{"id": args.KeyID})
+		return map[string]any{"revoked": v}, e
+	case "get_stats":
+		periods := map[string]time.Duration{"1m": time.Minute, "5m": 5 * time.Minute, "15m": 15 * time.Minute, "1h": time.Hour, "4h": 4 * time.Hour, "12h": 12 * time.Hour, "24h": 24 * time.Hour, "7d": 7 * 24 * time.Hour, "30d": 30 * 24 * time.Hour}
+		if args.Window == "" {
+			args.Window = "1h"
+		}
+		q := url.Values{}
+		if args.Window != "all" {
+			duration, ok := periods[args.Window]
+			if !ok {
+				return nil, fmt.Errorf("unsupported window")
+			}
+			q.Set("since", time.Now().UTC().Add(-duration).Format(time.RFC3339Nano))
+		}
+		if args.UserID > 0 {
+			q.Set("user", strconv.FormatInt(args.UserID, 10))
+		}
+		if args.KeyID > 0 {
+			q.Set("key", strconv.FormatInt(args.KeyID, 10))
+		}
+		if args.Model != "" {
+			q.Set("model", args.Model)
+		}
+		usage, e := invoke("GET", "/admin/usage?"+q.Encode(), nil)
+		if e != nil {
+			return nil, e
+		}
+		perf, e := invoke("GET", "/admin/performance?"+q.Encode(), nil)
+		return map[string]any{"window": args.Window, "usage": usage, "performance": perf}, e
+	}
+	return nil, fmt.Errorf("unknown tool")
+}

@@ -393,3 +393,47 @@ func TestBootstrapAndLocalPasswordReset(t *testing.T) {
 		t.Fatal("reset of nonexistent user succeeded")
 	}
 }
+
+func TestConfiguredHTTPSPublicOrigins(t *testing.T) {
+	t.Setenv("PUBLIC_ORIGINS", "https://proxy.example.test,https://192.0.2.10")
+	for _, host := range []string{"proxy.example.test", "192.0.2.10"} {
+		r := httptest.NewRequest("POST", "http://"+host+"/auth/login", nil)
+		r.Header.Set("X-Model-Meter", "dashboard")
+		r.Header.Set("Origin", "https://"+host)
+		if !dashboardMutationAllowed(r) || !sessionCookie(r, "session", time.Now().Add(time.Hour), 3600).Secure {
+			t.Fatal("TLS proxy origin rejected or cookie not Secure")
+		}
+		r.Header.Set("Origin", "https://attacker.example")
+		if dashboardMutationAllowed(r) {
+			t.Fatal("cross-origin request accepted")
+		}
+		r.Header.Set("Origin", "https://"+host)
+		r.Header.Del("X-Model-Meter")
+		if dashboardMutationAllowed(r) {
+			t.Fatal("CSRF header requirement bypassed")
+		}
+	}
+	r := httptest.NewRequest("POST", "http://127.0.0.1/auth/login", nil)
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if requestScheme(r) != "http" || sessionCookie(r, "session", time.Now(), 3600).Secure {
+		t.Fatal("untrusted forwarded scheme accepted")
+	}
+}
+
+func TestAdminKeyDefaultsToNamedOwner(t *testing.T) {
+	a, s, _ := fixture(t, func(http.ResponseWriter, *http.Request) {})
+	res := call(t, s, "/admin/keys", "admin-secret", `{"name":"Named admin key"}`)
+	if res.StatusCode != 201 {
+		t.Fatal("key creation failed")
+	}
+	var created struct {
+		ID int64
+	}
+	if e := json.NewDecoder(res.Body).Decode(&created); e != nil {
+		t.Fatal(e)
+	}
+	var owner int64
+	if e := a.db.QueryRow("SELECT user_id FROM keys WHERE id=?", created.ID).Scan(&owner); e != nil || owner != 0 {
+		t.Fatal("named administrator key is unowned", e)
+	}
+}

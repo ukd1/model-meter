@@ -51,6 +51,23 @@ func (a *App) authenticate(r *http.Request) (dashboardIdentity, error) {
 	return p, err
 }
 
+// PUBLIC_ORIGINS declares HTTPS-only external hosts behind TLS-terminating proxies.
+// Never infer this from untrusted Forwarded or X-Forwarded-Proto headers.
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	for _, value := range strings.Split(env("PUBLIC_ORIGINS", ""), ",") {
+		origin, err := url.Parse(strings.TrimSpace(value))
+		if err == nil && origin.Scheme == "https" && origin.Host != "" &&
+			origin.User == nil && origin.Path == "" && origin.RawQuery == "" && origin.Fragment == "" &&
+			strings.EqualFold(origin.Host, r.Host) {
+			return "https"
+		}
+	}
+	return "http"
+}
+
 // A non-simple header prevents cross-origin form submissions from using cookies.
 // Origin and Fetch Metadata checks also reject explicitly cross-site requests.
 func dashboardMutationAllowed(r *http.Request) bool {
@@ -59,10 +76,7 @@ func dashboardMutationAllowed(r *http.Request) bool {
 	}
 	if origin := r.Header.Get("Origin"); origin != "" {
 		parsed, err := url.Parse(origin)
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
+		scheme := requestScheme(r)
 		if err != nil || parsed.Scheme != scheme || !strings.EqualFold(parsed.Host, r.Host) || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
 			return false
 		}
@@ -71,7 +85,7 @@ func dashboardMutationAllowed(r *http.Request) bool {
 }
 
 func sessionCookie(r *http.Request, value string, expires time.Time, maxAge int) *http.Cookie {
-	return &http.Cookie{Name: sessionCookieName, Value: value, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: maxAge}
+	return &http.Cookie{Name: sessionCookieName, Value: value, Path: "/", HttpOnly: true, Secure: requestScheme(r) == "https", SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: maxAge}
 }
 
 func (a *App) deleteSession(r *http.Request) error {

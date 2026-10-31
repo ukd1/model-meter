@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -281,4 +282,200 @@ func seedTestUser(t *testing.T, a *App, name, password string) int64 {
 	}
 	id, _ := result.LastInsertId()
 	return id
+}
+
+func TestImportedRestrictionsAndModelAlias(t *testing.T) {
+	var calls atomic.Int32
+	a, s, key := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body struct {
+			Model    string
+			Stream   bool
+			Messages []struct{ Content string }
+		}
+		if e := json.NewDecoder(r.Body).Decode(&body); e != nil || body.Model != "physical-model" ||
+			len(body.Messages) != 1 || body.Messages[0].Content != "legacy-alias" {
+			t.Error("model alias rewrite changed unrelated content")
+		}
+		if body.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n")
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"usage":{"prompt_tokens":2,"completion_tokens":1}}`)
+		}
+	})
+	a.modelAliases = map[string]string{"legacy-alias": "physical-model"}
+	if _, e := a.db.Exec(`UPDATE keys SET allowed_routes='["/v1/chat/completions"]',allowed_models='["legacy-alias"]' WHERE hash=?`, hash(key)); e != nil {
+		t.Fatal(e)
+	}
+	if call(t, s, "/v1/messages", key, `{"model":"legacy-alias"}`).StatusCode != 403 ||
+		call(t, s, "/v1/chat/completions", key, `{"model":"other"}`).StatusCode != 403 {
+		t.Fatal("imported restrictions were bypassed")
+	}
+	for _, streamed := range []bool{false, true} {
+		body := fmt.Sprintf(`{"model":"legacy-alias","messages":[{"content":"legacy-alias"}],"stream":%t}`, streamed)
+		res := call(t, s, "/v1/chat/completions", key, body)
+		io.Copy(io.Discard, res.Body)
+		if res.StatusCode != 200 {
+			t.Fatal("permitted alias request failed")
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatal("rejected requests reached upstream")
+	}
+	if _, e := a.db.Exec("UPDATE keys SET expires=? WHERE hash=?", time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), hash(key)); e != nil {
+		t.Fatal(e)
+	}
+	if call(t, s, "/v1/chat/completions", key, `{"model":"legacy-alias"}`).StatusCode != 401 {
+		t.Fatal("expired key accepted")
+	}
+	if _, e := a.db.Exec("UPDATE keys SET expires=NULL,allowed_routes='malformed' WHERE hash=?", hash(key)); e != nil {
+		t.Fatal(e)
+	}
+	if call(t, s, "/v1/chat/completions", key, `{"model":"legacy-alias"}`).StatusCode != 403 {
+		t.Fatal("malformed policy allowed access")
+	}
+	if calls.Load() != 2 {
+		t.Fatal("invalid key or policy reached upstream")
+	}
+}
+
+func TestMCPManagementAndHistory(t *testing.T) {
+	a, _, _ := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		reply(w, 200, map[string]any{"data": []any{}})
+	})
+	secret := strings.Repeat("m", 48)
+	call := func(method string, params any, credential, origin string) (int, map[string]any) {
+		body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+		req := httptest.NewRequest("POST", "http://localhost/mcp", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if credential != "" {
+			req.Header.Set("Authorization", "Bearer "+credential)
+		}
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rec := httptest.NewRecorder()
+		a.handler().ServeHTTP(rec, req)
+		var value map[string]any
+		json.Unmarshal(rec.Body.Bytes(), &value)
+		return rec.Code, value
+	}
+	t.Setenv("MCP_ADMIN_TOKEN", "")
+	t.Setenv("MCP_ADMIN_USERNAME", "admin")
+	if status, _ := call("tools/list", nil, secret, ""); status != 404 {
+		t.Fatal("MCP must be opt-in")
+	}
+	t.Setenv("MCP_ADMIN_TOKEN", secret)
+	for _, credential := range []string{"", "wrong", "client-secret"} {
+		if status, _ := call("tools/list", nil, credential, ""); status != 401 {
+			t.Fatal("MCP accepted non-management credential")
+		}
+	}
+	if status, _ := call("tools/list", nil, secret, "https://evil.example"); status != 403 {
+		t.Fatal("cross-origin MCP accepted")
+	}
+	_, init := call("initialize", map[string]any{"protocolVersion": "2025-06-18"}, secret, "")
+	if init["result"].(map[string]any)["protocolVersion"] != "2025-06-18" {
+		t.Fatal("initialize failed")
+	}
+	_, tools := call("tools/list", nil, secret, "")
+	if len(tools["result"].(map[string]any)["tools"].([]any)) != 5 {
+		t.Fatal("tool discovery failed")
+	}
+	tool := func(name string, args any) map[string]any {
+		t.Helper()
+		status, v := call("tools/call", map[string]any{"name": name, "arguments": args}, secret, "")
+		if status != 200 {
+			t.Fatal("MCP failed")
+		}
+		return v["result"].(map[string]any)
+	}
+	good := func(name string, args any) map[string]any {
+		t.Helper()
+		result := tool(name, args)
+		if result["isError"] == true {
+			t.Fatalf("tool %s failed", name)
+		}
+		return result["structuredContent"].(map[string]any)
+	}
+	uid := seedTestUser(t, a, "mcp-user", "user-password-123")
+	created := good("create_key", map[string]any{"name": "Agent key", "user_id": uid})["created"].(map[string]any)
+	id := int64(created["id"].(float64))
+	key := created["key"].(string)
+	var owner int64
+	if err := a.db.QueryRow("SELECT user_id FROM keys WHERE id=?", id).Scan(&owner); err != nil || owner != uid {
+		t.Fatal("key owner not preserved")
+	}
+	for _, v := range []struct {
+		age    time.Duration
+		tokens int
+	}{{10 * time.Minute, 100}, {2 * time.Hour, 1000}} {
+		_, err := a.db.Exec("INSERT INTO requests(key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,outcome) VALUES(?,?,'test','POST','/v1/chat/completions','test',200,1000,?,20,'complete')", id, time.Now().UTC().Add(-v.age).Format(time.RFC3339Nano), v.tokens)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkUsage := func(window string, want float64) {
+		t.Helper()
+		stats := good("get_stats", map[string]any{"window": window, "key_id": id})
+		usage := stats["usage"].([]any)
+		if len(usage) != 1 || usage[0].(map[string]any)["input_tokens"] != want {
+			t.Fatalf("wrong usage for %s", window)
+		}
+	}
+	checkUsage("1h", 100)
+	checkUsage("all", 1100)
+	good("revoke_key", map[string]any{"key_id": id})
+	active := good("list_keys", map[string]any{})["keys"].([]any)
+	for _, v := range active {
+		if int64(v.(map[string]any)["id"].(float64)) == id {
+			t.Fatal("revoked key visible by default")
+		}
+	}
+	audit := good("list_keys", map[string]any{"include_revoked": true})["keys"].([]any)
+	found := false
+	for _, v := range audit {
+		if int64(v.(map[string]any)["id"].(float64)) == id {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("revoked record deleted")
+	}
+	checkUsage("all", 1100)
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	rec := httptest.NewRecorder()
+	a.handler().ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Fatal("revoked key accepted")
+	}
+	for _, test := range []struct {
+		name string
+		args any
+	}{
+		{"get_stats", map[string]any{"window": "nonsense"}},
+		{"create_key", map[string]any{"user_id": 0, "name": "bad"}},
+		{"revoke_key", map[string]any{"key_id": id, "unexpected": true}},
+		{"get_stats", map[string]any{"key_id": nil}},
+	} {
+		if tool(test.name, test.args)["isError"] != true {
+			t.Fatal("invalid tool arguments accepted")
+		}
+	}
+	if _, err := a.db.Exec("UPDATE users SET admin=0 WHERE username='admin'"); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := call("tools/list", nil, secret, ""); status != 403 {
+		t.Fatal("demoted admin still accepted")
+	}
+	if _, err := a.db.Exec("UPDATE users SET admin=1,disabled=1 WHERE username='admin'"); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := call("tools/list", nil, secret, ""); status != 403 {
+		t.Fatal("disabled admin still accepted")
+	}
 }

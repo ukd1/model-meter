@@ -42,10 +42,18 @@ func migrateAnonymousRequests(db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(`CREATE TABLE requests_nullable(id INTEGER PRIMARY KEY,key_id INTEGER REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
- INSERT INTO requests_nullable(id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome) SELECT id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome FROM requests;
- DROP TABLE requests;
- ALTER TABLE requests_nullable RENAME TO requests;`)
+	var legacyColumns int
+	if err = tx.QueryRow("SELECT count(*) FROM pragma_table_info('requests') WHERE name='legacy_request_id'").Scan(&legacyColumns); err != nil {
+		return err
+	}
+	extraDefinition, extraNames := "", ""
+	if legacyColumns > 0 {
+		extraDefinition = ",legacy_request_id TEXT UNIQUE,legacy_reference_usd REAL,legacy_status TEXT"
+		extraNames = ",legacy_request_id,legacy_reference_usd,legacy_status"
+	}
+	_, err = tx.Exec("CREATE TABLE requests_nullable(id INTEGER PRIMARY KEY,key_id INTEGER REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL" + extraDefinition + ");" +
+		" INSERT INTO requests_nullable(id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome" + extraNames + ") SELECT id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome" + extraNames + " FROM requests;" +
+		" DROP TABLE requests; ALTER TABLE requests_nullable RENAME TO requests;")
 	if err != nil {
 		return err
 	}

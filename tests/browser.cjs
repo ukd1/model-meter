@@ -46,7 +46,7 @@ const {chromium,request}=require('playwright');
   // An external configuration change must reach this user's already-open UI.
   await adminAPI('key-update',{id:keyID,name:'Live rename '+tag});await view('access');await page.locator('#keyRows tr').filter({hasText:'Live rename '+tag}).waitFor({timeout:3000});
   await page.setViewportSize({width:390,height:844});await view('overview');await page.screenshot({path:'/tmp/model-meter-mobile.png',fullPage:true});if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth))throw Error('mobile overflow');
-  await view('access');page.on('dialog',d=>d.accept());await page.locator('#keyRows button.danger').click();await page.waitForFunction(()=>document.querySelector('#keyRows').textContent.includes('Revoked'));const revoked=await context.request.get(base+'/v1/models',{headers:{Authorization:'Bearer '+key}});if(revoked.status()!==401)throw Error('revoked key accepted');
+  await view('access');page.on('dialog',d=>d.accept());await page.locator('#keyRows button.danger').click();await page.waitForFunction(()=>!document.querySelector('#keyRows button.danger'));const revoked=await context.request.get(base+'/v1/models',{headers:{Authorization:'Bearer '+key}});if(revoked.status()!==401)throw Error('revoked key accepted');
   await adminAPI('users/update',{id:userID,admin:true});await page.locator('#login').waitFor({state:'visible'});await login('browser-qa-'+tag,userToken);await view('access');
   if(!await page.locator('#usersPanel').isVisible())throw Error('named administrator management unavailable');
   if(!(await page.locator('#identityName').textContent()).includes('Browser QA renamed'))throw Error('named administrator identity missing');
