@@ -8,16 +8,24 @@ import (
 	"net/http"
 )
 
-// Existing accounting rows keep their IDs and key references. SQLite requires
-// rebuilding a table to remove NOT NULL; the transaction also preserves indexes
-// and triggers so a failed migration leaves the original table intact.
-func migrateAnonymousRequests(db *sql.DB) error {
-	var required bool
+// Existing accounting rows keep their IDs and key references. The current shape
+// needs two things SQLite cannot do in place: a nullable key_id so anonymous
+// traffic can be recorded, and a stored epoch column so window predicates can use
+// an index instead of scanning. Both therefore need a table rebuild. The
+// transaction also preserves indexes, triggers and any legacy columns so a failed
+// migration leaves the original table intact.
+func migrateRequests(db *sql.DB) error {
+	var required int
 	if err := db.QueryRow(`SELECT "notnull" FROM pragma_table_info('requests') WHERE name='key_id'`).Scan(&required); err != nil {
 		return err
 	}
-	if !required {
-		return nil
+	var hasTimeUnix int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info('requests') WHERE name='time_unix'`).Scan(&hasTimeUnix); err != nil {
+		return err
+	}
+	if required == 0 && hasTimeUnix > 0 {
+		_, err := db.Exec(`CREATE INDEX IF NOT EXISTS requests_unix ON requests(time_unix)`)
+		return err
 	}
 	tx, err := db.Begin()
 	if err != nil {
@@ -51,9 +59,10 @@ func migrateAnonymousRequests(db *sql.DB) error {
 		extraDefinition = ",legacy_request_id TEXT UNIQUE,legacy_reference_usd REAL,legacy_status TEXT"
 		extraNames = ",legacy_request_id,legacy_reference_usd,legacy_status"
 	}
-	_, err = tx.Exec("CREATE TABLE requests_nullable(id INTEGER PRIMARY KEY,key_id INTEGER REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL" + extraDefinition + ");" +
-		" INSERT INTO requests_nullable(id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome" + extraNames + ") SELECT id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome" + extraNames + " FROM requests;" +
-		" DROP TABLE requests; ALTER TABLE requests_nullable RENAME TO requests;")
+	// time_unix is generated, so it is absent from the INSERT column list.
+	_, err = tx.Exec("CREATE TABLE requests_current(id INTEGER PRIMARY KEY,key_id INTEGER REFERENCES keys(id),time TEXT NOT NULL,time_unix INTEGER GENERATED ALWAYS AS (CAST(strftime('%s',time) AS INTEGER)) STORED,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL" + extraDefinition + ");" +
+		" INSERT INTO requests_current(id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome" + extraNames + ") SELECT id,key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome" + extraNames + " FROM requests;" +
+		" DROP TABLE requests; ALTER TABLE requests_current RENAME TO requests;")
 	if err != nil {
 		return err
 	}
@@ -61,6 +70,9 @@ func migrateAnonymousRequests(db *sql.DB) error {
 		if _, err = tx.Exec(statement); err != nil {
 			return err
 		}
+	}
+	if _, err = tx.Exec(`CREATE INDEX IF NOT EXISTS requests_unix ON requests(time_unix)`); err != nil {
+		return err
 	}
 	var violations int
 	if err = tx.QueryRow(`SELECT count(*) FROM pragma_foreign_key_check('requests')`).Scan(&violations); err != nil {
@@ -71,6 +83,10 @@ func migrateAnonymousRequests(db *sql.DB) error {
 	}
 	return tx.Commit()
 }
+
+// migrateAnonymousRequests keeps the original entry point, which tests and prior
+// versions call; the migration now covers the whole requests table shape.
+func migrateAnonymousRequests(db *sql.DB) error { return migrateRequests(db) }
 
 func (a *App) loadSettings() error {
 	a.settingsOnce.Do(func() {

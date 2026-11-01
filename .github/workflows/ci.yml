@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify dependencies
+        run: go mod verify
+      - name: Vet
+        run: go vet ./...
+      # cgo and a C compiler are required by the SQLite driver; the runner
+      # image provides gcc, so no extra setup is needed.
+      - name: Test with race detector
+        run: go test -race ./...
+      - name: Build
+        run: CGO_ENABLED=1 go build -o model-meter .
+      - name: Vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

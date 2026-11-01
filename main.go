@@ -44,11 +44,12 @@ type App struct {
 	upstream       string
 	upstreamKey    string
 	client         *http.Client
-	records        chan []any
+	records        chan requestRecord
 	loggerWG       sync.WaitGroup
 	dropped        atomic.Uint64
 	live           liveHub
 	allowAnonymous atomic.Bool
+	login          loginLimiter
 	settingsOnce   sync.Once
 	settingsErr    error
 	settingsMu     sync.Mutex
@@ -77,7 +78,7 @@ func openDB(path string) (*sql.DB, error) {
 	db.SetMaxOpenConns(8)
 	_, e = db.Exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,disabled INTEGER NOT NULL DEFAULT 0,admin INTEGER NOT NULL DEFAULT 0,created TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS keys(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),name TEXT NOT NULL,hash TEXT UNIQUE NOT NULL,prefix TEXT NOT NULL,created TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0);
- CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,key_id INTEGER REFERENCES keys(id),time TEXT NOT NULL,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS requests(id INTEGER PRIMARY KEY,key_id INTEGER REFERENCES keys(id),time TEXT NOT NULL,time_unix INTEGER GENERATED ALWAYS AS (CAST(strftime('%s',time) AS INTEGER)) STORED,model TEXT NOT NULL,method TEXT NOT NULL,path TEXT NOT NULL,source TEXT NOT NULL,status INTEGER NOT NULL,duration_ms INTEGER NOT NULL,input_tokens INTEGER,output_tokens INTEGER,cached_tokens INTEGER,outcome TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS settings(name TEXT PRIMARY KEY,value INTEGER NOT NULL CHECK(value IN (0,1)));
  CREATE TABLE IF NOT EXISTS sessions(hash TEXT PRIMARY KEY,credential_hash TEXT NOT NULL,expires INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires);
@@ -133,10 +134,25 @@ func openDB(path string) (*sql.DB, error) {
 	}
 	return db, nil
 }
+
+// Encode before committing the status so a failure cannot produce a success
+// response with a truncated body.
 func reply(w http.ResponseWriter, status int, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		http.Error(w, `{"error":{"type":"proxy_error","message":"response encoding failed"}}`, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	w.Write(body)
+}
+
+// JSONContentType accepts the media type with optional parameters. Comparing the
+// raw header rejects valid requests such as "application/json; charset=utf-8".
+func JSONContentType(r *http.Request) bool {
+	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && media == "application/json"
 }
 func fail(w http.ResponseWriter, status int, msg string) {
 	reply(w, status, map[string]any{"error": map[string]string{"message": msg, "type": "proxy_error"}})
@@ -210,7 +226,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Method == "POST" && r.Header.Get("Content-Type") != "application/json" {
+	if r.Method == "POST" && !JSONContentType(r) {
 		fail(w, 415, "application/json required")
 		return
 	}
@@ -323,7 +339,18 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 			}
 			encoded = &h
 		}
-		res, err := a.db.Exec(`UPDATE users SET disabled=COALESCE(?,disabled),admin=COALESCE(?,admin),username=COALESCE(?,username),password_hash=COALESCE(?,password_hash),name=CASE WHEN ?='' THEN name ELSE ? END WHERE id=?`, v.Disabled, v.Admin, v.Username, encoded, strings.TrimSpace(v.Name), strings.TrimSpace(v.Name), v.ID)
+		tx, err := a.db.Begin()
+		if err != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		defer tx.Rollback()
+		var wasAdmin, wasDisabled int
+		if err = tx.QueryRow(`SELECT admin,disabled FROM users WHERE id=?`, v.ID).Scan(&wasAdmin, &wasDisabled); err != nil {
+			fail(w, 404, "user not found")
+			return
+		}
+		res, err := tx.Exec(`UPDATE users SET disabled=COALESCE(?,disabled),admin=COALESCE(?,admin),username=COALESCE(?,username),password_hash=COALESCE(?,password_hash),name=CASE WHEN ?='' THEN name ELSE ? END WHERE id=?`, v.Disabled, v.Admin, v.Username, encoded, strings.TrimSpace(v.Name), strings.TrimSpace(v.Name), v.ID)
 		if err != nil {
 			fail(w, 409, "username already exists or database unavailable")
 			return
@@ -331,6 +358,25 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		n, _ := res.RowsAffected()
 		if n == 0 {
 			fail(w, 404, "user not found")
+			return
+		}
+		// Refuse to leave the installation without a usable administrator. The
+		// count runs after the write inside the same transaction, so two concurrent
+		// demotions cannot both succeed, and bootstrap recovery only runs at startup,
+		// which an operator locked out of the dashboard cannot trigger.
+		if wasAdmin == 1 && wasDisabled == 0 && ((v.Admin != nil && !*v.Admin) || (v.Disabled != nil && *v.Disabled)) {
+			var remaining int
+			if err = tx.QueryRow(`SELECT count(*) FROM users WHERE admin=1 AND disabled=0 AND password_hash<>''`).Scan(&remaining); err != nil {
+				fail(w, 500, "database error")
+				return
+			}
+			if remaining == 0 {
+				fail(w, 400, "at least one active administrator is required")
+				return
+			}
+		}
+		if err = tx.Commit(); err != nil {
+			fail(w, 500, "database error")
 			return
 		}
 		a.notifyUser(v.ID)
@@ -361,7 +407,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		a.performance(w, r, where, args)
 	case r.URL.Path == "/admin/timeseries" && r.Method == "GET":
 		where, args := scopedFilters()
-		a.query(w, `SELECT strftime('%Y-%m-%dT%H:%M:00Z',r.time) AS time,count(*) AS requests,coalesce(sum(input_tokens),0) AS input_tokens,coalesce(sum(output_tokens),0) AS output_tokens,round(avg(duration_ms)) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE julianday(r.time)>=julianday('now','-1 hour') AND `+where+` GROUP BY 1 ORDER BY 1`, args...)
+		a.timeseries(w, r.URL.Query().Get("since"), where, args)
 	case r.URL.Path == "/admin/status" && r.Method == "GET":
 		reply(w, 200, map[string]any{"dropped_records": a.dropped.Load(), "queued_records": len(a.records)})
 	case r.URL.Path == "/admin/keys" && r.Method == "GET":
@@ -420,7 +466,7 @@ func (a *App) adminAPI(w http.ResponseWriter, r *http.Request) {
 		reply(w, 200, map[string]bool{"ok": true})
 	case r.URL.Path == "/admin/usage" && r.Method == "GET":
 		where, args := scopedFilters()
-		a.query(w, `SELECT k.id AS key_id,coalesce(k.name,'Anonymous') AS name,k.user_id,(SELECT name FROM users WHERE id=k.user_id) AS user_name,r.model,count(*) AS requests,sum(CASE WHEN r.status>=400 OR r.outcome!='complete' THEN 1 ELSE 0 END) AS errors,sum(r.input_tokens) AS input_tokens,sum(r.output_tokens) AS output_tokens,sum(r.cached_tokens) AS cached_tokens,sum(CASE WHEN r.input_tokens IS NULL THEN 1 ELSE 0 END) AS unmetered,round(avg(r.duration_ms)) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` GROUP BY k.id,r.model ORDER BY requests DESC`, args...)
+		a.query(w, `SELECT k.id AS key_id,coalesce(k.name,'Anonymous') AS name,k.user_id,(SELECT name FROM users WHERE id=k.user_id) AS user_name,r.model,count(*) AS requests,sum(CASE WHEN r.status>=400 OR r.outcome!='complete' THEN 1 ELSE 0 END) AS errors,coalesce(sum(r.input_tokens),0) AS input_tokens,coalesce(sum(r.output_tokens),0) AS output_tokens,coalesce(sum(r.cached_tokens),0) AS cached_tokens,sum(CASE WHEN r.input_tokens IS NULL THEN 1 ELSE 0 END) AS unmetered,round(avg(r.duration_ms)) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` GROUP BY k.id,r.model ORDER BY requests DESC`, args...)
 	case r.URL.Path == "/admin/requests" && r.Method == "GET":
 		where, args := scopedFilters()
 		a.query(w, `SELECT r.*,coalesce(k.name,'Anonymous') AS key_name FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY r.id DESC LIMIT 200`, args...)
@@ -442,7 +488,9 @@ func filters(r *http.Request) (string, []any) {
 		}
 	}
 	if x := r.URL.Query().Get("since"); x != "" {
-		s += " AND julianday(r.time)>=julianday(?)"
+		// The conversion applies to the parameter, so the predicate can still use
+		// the requests(time_unix) index.
+		s += " AND r.time_unix>=CAST(strftime('%s',?) AS INTEGER)"
 		args = append(args, x)
 	}
 	return s, args
@@ -647,26 +695,36 @@ func (m *Meter) Write(p []byte) (int, error) {
 		}
 		return n, nil
 	}
-	for _, c := range p {
-		if c == '\n' {
-			if !m.overflow {
-				line := bytes.TrimSpace(m.buf)
-				if bytes.HasPrefix(line, []byte("data:")) {
-					m.parse(bytes.TrimSpace(line[5:]))
-				}
-			}
-			m.buf = nil
-			m.overflow = false
-		} else if !m.overflow {
-			if len(m.buf) < 8<<20 {
-				m.buf = append(m.buf, c)
-			} else {
-				m.buf = nil
-				m.overflow = true
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			m.append(p)
+			break
+		}
+		m.append(p[:i])
+		if !m.overflow {
+			if line := bytes.TrimSpace(m.buf); bytes.HasPrefix(line, []byte("data:")) {
+				m.parse(bytes.TrimSpace(line[5:]))
 			}
 		}
+		m.buf = nil
+		m.overflow = false
+		p = p[i+1:]
 	}
 	return n, nil
+}
+
+// append keeps at most 8 MiB of the current line; longer lines stay unmetered.
+func (m *Meter) append(p []byte) {
+	if m.overflow || len(p) == 0 {
+		return
+	}
+	if len(m.buf)+len(p) > 8<<20 {
+		m.buf = nil
+		m.overflow = true
+		return
+	}
+	m.buf = append(m.buf, p...)
 }
 func (m *Meter) finish() {
 	if !m.SSE && !m.overflow {
@@ -674,17 +732,23 @@ func (m *Meter) finish() {
 	}
 }
 func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
-	var keyID any
+	var keyID, ownerID any
 	var allowedRoutes, allowedModels = "[]", "[]"
 	missingCredential := len(r.Header.Values("Authorization")) == 0 && len(r.Header.Values("X-Api-Key")) == 0
 	if !missingCredential || !a.allowAnonymous.Load() {
 		var id int64
+		var owner sql.NullInt64
 		credential := proxyCredential(r)
-		if credential == "" || a.db.QueryRow(`SELECT k.id,k.allowed_routes,k.allowed_models FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.expires IS NULL OR julianday(k.expires)>julianday('now')) AND (k.user_id IS NULL OR u.disabled=0)`, hash(credential)).Scan(&id, &allowedRoutes, &allowedModels) != nil {
+		if credential == "" || a.db.QueryRow(`SELECT k.id,k.user_id,k.allowed_routes,k.allowed_models FROM keys k LEFT JOIN users u ON u.id=k.user_id WHERE k.hash=? AND k.revoked=0 AND (k.expires IS NULL OR julianday(k.expires)>julianday('now')) AND (k.user_id IS NULL OR u.disabled=0)`, hash(credential)).Scan(&id, &owner, &allowedRoutes, &allowedModels) != nil {
 			fail(w, 401, "valid proxy key required")
 			return
 		}
 		keyID = id
+		// The owner travels with the record so the accounting worker can wake the
+		// right dashboards without querying the keys table per batch.
+		if owner.Valid {
+			ownerID = owner.Int64
+		}
 	}
 	start := time.Now()
 	status := 502
@@ -694,7 +758,7 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 	// Store only a known route label, never query parameters or arbitrary URL content.
 	path, method := proxyRoute(r.URL.Path)
 	defer func() {
-		record := []any{keyID, start.UTC().Format(time.RFC3339Nano), m.Model, r.Method, path, source, status, time.Since(start).Milliseconds(), m.Input, m.Output, m.Cached, outcome}
+		record := requestRecord{keyID: keyID, owner: ownerID, args: []any{start.UTC().Format(time.RFC3339Nano), m.Model, r.Method, path, source, status, time.Since(start).Milliseconds(), m.Input, m.Output, m.Cached, outcome}}
 		select {
 		case a.records <- record:
 		default:
@@ -702,7 +766,10 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if !allowedValue(allowedRoutes, r.URL.Path) {
+	// Accept the route by its raw path or by the recorded label, so an allowlist
+	// may name either "/v1/models/xyz" or the "/v1/models/:model" entry seen in
+	// request history.
+	if !allowedValue(allowedRoutes, r.URL.Path) && !allowedValue(allowedRoutes, path) {
 		status, outcome = 403, "rejected"
 		fail(w, status, "endpoint not permitted for this key")
 		return
@@ -721,38 +788,59 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "POST" {
-		var obj map[string]json.RawMessage
-		if json.Unmarshal(body, &obj) != nil || obj == nil {
+		// Decode only the routing fields first. The body is re-encoded only when a
+		// model alias or stream_options injection requires it, which keeps the
+		// common path to a single copy of the request instead of three.
+		var meta struct {
+			Model  json.RawMessage `json:"model"`
+			Stream json.RawMessage `json:"stream"`
+		}
+		if trimmed := bytes.TrimLeft(body, " \t\r\n"); len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(body, &meta) != nil {
 			status = 400
 			outcome = "rejected"
 			fail(w, status, "JSON object required")
 			return
 		}
-		json.Unmarshal(obj["model"], &m.Model)
+		json.Unmarshal(meta.Model, &m.Model)
 		if !allowedValue(allowedModels, m.Model) {
 			status, outcome = 403, "rejected"
 			fail(w, status, "model not permitted for this key")
 			return
 		}
-		if mapped, ok := a.modelAliases[m.Model]; ok {
-			obj["model"], _ = json.Marshal(mapped)
-			body, _ = json.Marshal(obj)
-			m.Model = mapped
+		mapped, alias := a.modelAliases[m.Model]
+		var stream bool
+		json.Unmarshal(meta.Stream, &stream)
+		injectUsage := stream && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions")
+		if alias || injectUsage {
+			var obj map[string]json.RawMessage
+			if json.Unmarshal(body, &obj) != nil {
+				status = 400
+				outcome = "rejected"
+				fail(w, status, "JSON object required")
+				return
+			}
+			if alias {
+				obj["model"], _ = json.Marshal(mapped)
+				m.Model = mapped
+			}
+			if injectUsage {
+				opts := map[string]any{}
+				json.Unmarshal(obj["stream_options"], &opts)
+				if opts == nil {
+					opts = map[string]any{}
+				}
+				opts["include_usage"] = true
+				obj["stream_options"], _ = json.Marshal(opts)
+			}
+			if body, e = json.Marshal(obj); e != nil {
+				status = 400
+				outcome = "rejected"
+				fail(w, status, "JSON object required")
+				return
+			}
 		}
 		if len(m.Model) > 256 {
 			m.Model = ""
-		}
-		var stream bool
-		json.Unmarshal(obj["stream"], &stream)
-		if stream && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions") {
-			opts := map[string]any{}
-			json.Unmarshal(obj["stream_options"], &opts)
-			if opts == nil {
-				opts = map[string]any{}
-			}
-			opts["include_usage"] = true
-			obj["stream_options"], _ = json.Marshal(opts)
-			body, _ = json.Marshal(obj)
 		}
 	}
 	req, e := http.NewRequestWithContext(r.Context(), r.Method, a.upstream+r.URL.RequestURI(), bytes.NewReader(body))
@@ -843,7 +931,16 @@ func main() {
 	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		log.Fatal("invalid upstream URL")
 	}
-	a := &App{db: db, upstream: up, upstreamKey: os.Getenv("UPSTREAM_API_KEY"), client: &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}}
+	a := &App{db: db, upstream: up, upstreamKey: os.Getenv("UPSTREAM_API_KEY"), client: &http.Client{Timeout: 30 * time.Minute, CheckRedirect: func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }, Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 3 * time.Minute,
+		ExpectContinueTimeout: time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   32,
+	}}}
 	if e := json.Unmarshal([]byte(env("MODEL_ALIASES", "{}")), &a.modelAliases); e != nil {
 		log.Fatal("invalid MODEL_ALIASES JSON")
 	}
@@ -869,20 +966,29 @@ func main() {
 }
 
 // The request path only performs a non-blocking enqueue. One worker owns batch writes.
+//
+// A record carries its owner so the worker can wake the right dashboards without
+// querying the keys table for every committed batch.
+type requestRecord struct {
+	keyID any
+	owner any
+	args  []any
+}
+
 func (a *App) startLogger() {
-	a.records = make(chan []any, 8192)
+	a.records = make(chan requestRecord, 8192)
 	a.loggerWG.Add(1)
 	go func() {
 		defer a.loggerWG.Done()
-		batch := make([][]any, 0, 100)
+		batch := make([]requestRecord, 0, 100)
 		flush := func() {
 			if len(batch) == 0 {
 				return
 			}
 			tx, e := a.db.Begin()
 			if e == nil {
-				for _, r := range batch {
-					_, e = tx.Exec(`INSERT INTO requests(key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, r...)
+				for _, record := range batch {
+					_, e = tx.Exec(`INSERT INTO requests(key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, append([]any{record.keyID}, record.args...)...)
 					if e != nil {
 						break
 					}
@@ -898,15 +1004,14 @@ func (a *App) startLogger() {
 				log.Print("request accounting batch failed; dropped-record counter increased")
 			}
 			if e == nil {
-				ids := make([]any, 0, len(batch))
-				seen := map[any]bool{}
+				owners := map[int64]bool{}
 				for _, record := range batch {
-					if !seen[record[0]] {
-						seen[record[0]] = true
-						ids = append(ids, record[0])
+					if owner, ok := record.owner.(int64); ok {
+						owners[owner] = true
 					}
 				}
-				a.notifyKeys(ids...)
+				// Administrators are always woken; users only for their own records.
+				a.live.notify(owners)
 			} else {
 				a.live.notify(nil)
 			}

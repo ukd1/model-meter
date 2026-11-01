@@ -43,8 +43,28 @@ type performanceStats struct {
 	Series        []performancePoint `json:"series"`
 }
 
-// Compute in SQLite over the entire authorized window, never the recent-row cap.
-func distributionFor(ctx context.Context, tx *sql.Tx, where string, args []any, metric string, edges []float64) (distribution, error) {
+// windowTable holds the authorized window once per request. Percentiles,
+// histograms and the series all read it, so the requests table is scanned once
+// instead of five times. The surrounding transaction pins one connection, which
+// makes the temporary table private to the request.
+const windowTable = "mm_window"
+
+func buildWindow(ctx context.Context, tx *sql.Tx, where string, args []any, bucket int64) error {
+	if _, e := tx.ExecContext(ctx, `CREATE TEMP TABLE IF NOT EXISTS `+windowTable+`(bucket INTEGER,duration REAL,rate REAL,input_tokens INTEGER,output_tokens INTEGER)`); e != nil {
+		return e
+	}
+	if _, e := tx.ExecContext(ctx, `DELETE FROM `+windowTable); e != nil {
+		return e
+	}
+	// duration is NULL for non-inference rows so the latency distribution keeps
+	// its documented sample set, while the series still counts every request.
+	query := fmt.Sprintf(`INSERT INTO %s SELECT (r.time_unix/%d)*%d,CASE WHEN %s THEN r.duration_ms/1000.0 END,%s,r.input_tokens,r.output_tokens FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE %s`, windowTable, bucket, bucket, inferenceSQL, rateSQL, where)
+	_, e := tx.ExecContext(ctx, query, args...)
+	return e
+}
+
+// Compute over the entire authorized window, never the recent-row cap.
+func distributionFor(ctx context.Context, tx *sql.Tx, metric string, edges []float64) (distribution, error) {
 	d := distribution{Bins: make([]histogramBin, len(edges))}
 	for i, edge := range edges {
 		d.Bins[i].Lower = edge
@@ -53,17 +73,16 @@ func distributionFor(ctx context.Context, tx *sql.Tx, where string, args []any, 
 			d.Bins[i].Upper = &upper
 		}
 	}
-	base := `SELECT ` + metric + ` AS value FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE ` + where + ` AND ` + inferenceSQL
-	query := `WITH valueset AS (` + base + `), ranked AS (SELECT value,row_number() OVER (ORDER BY value) AS rn,count(*) OVER () AS total FROM valueset WHERE value IS NOT NULL AND value>=0) SELECT count(*),avg(value),max(CASE WHEN rn=(total+1)/2 THEN value END),max(CASE WHEN rn=(total*95+99)/100 THEN value END) FROM ranked`
-	if e := tx.QueryRowContext(ctx, query, args...).Scan(&d.Samples, &d.Mean, &d.P50, &d.P95); e != nil {
+	query := `WITH ranked AS (SELECT ` + metric + ` AS value,row_number() OVER (ORDER BY ` + metric + `) AS rn,count(*) OVER () AS total FROM ` + windowTable + ` WHERE ` + metric + ` IS NOT NULL AND ` + metric + `>=0) SELECT count(*),avg(value),max(CASE WHEN rn=(total+1)/2 THEN value END),max(CASE WHEN rn=(total*95+99)/100 THEN value END) FROM ranked`
+	if e := tx.QueryRowContext(ctx, query).Scan(&d.Samples, &d.Mean, &d.P50, &d.P95); e != nil {
 		return d, e
 	}
 	cases := []string{"CASE"}
 	for i := 1; i < len(edges); i++ {
-		cases = append(cases, fmt.Sprintf("WHEN value<%g THEN %d", edges[i], i-1))
+		cases = append(cases, fmt.Sprintf("WHEN "+metric+"<%g THEN %d", edges[i], i-1))
 	}
 	cases = append(cases, fmt.Sprintf("ELSE %d END", len(edges)-1))
-	rows, e := tx.QueryContext(ctx, `WITH valueset AS (`+base+`) SELECT `+strings.Join(cases, " ")+` AS bin,count(*) FROM valueset WHERE value IS NOT NULL AND value>=0 GROUP BY bin`, args...)
+	rows, e := tx.QueryContext(ctx, `SELECT `+strings.Join(cases, " ")+` AS bin,count(*) FROM `+windowTable+` WHERE `+metric+` IS NOT NULL AND `+metric+`>=0 GROUP BY bin`)
 	if e != nil {
 		return d, e
 	}
@@ -89,8 +108,9 @@ func chartBucket(span float64) int64 {
 func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, args []any) {
 	now := time.Now().UTC()
 	start := now.Add(-time.Hour)
-	if since := r.URL.Query().Get("since"); since != "" {
-		parsed, e := time.Parse(time.RFC3339Nano, since)
+	bounded := r.URL.Query().Get("since") != ""
+	if bounded {
+		parsed, e := time.Parse(time.RFC3339Nano, r.URL.Query().Get("since"))
 		if e != nil || parsed.After(now) {
 			fail(w, 400, "since must be a past RFC3339 timestamp")
 			return
@@ -99,36 +119,40 @@ func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, 
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	tx, e := a.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	// The window table is written inside this transaction, so it is not opened
+	// read-only; nothing outside the temporary schema is modified.
+	tx, e := a.db.BeginTx(ctx, nil)
 	if e != nil {
 		fail(w, 500, "database error")
 		return
 	}
 	defer tx.Rollback()
 	// All-time starts at the oldest matching record; an empty window defaults to 1h.
-	if r.URL.Query().Get("since") == "" {
-		var oldest sql.NullFloat64
-		e = tx.QueryRowContext(ctx, `SELECT min(unixepoch(r.time)) FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where, args...).Scan(&oldest)
+	if !bounded {
+		var oldest sql.NullInt64
+		e = tx.QueryRowContext(ctx, `SELECT min(r.time_unix) FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where, args...).Scan(&oldest)
 		if e != nil {
 			fail(w, 500, "database error")
 			return
 		}
 		if oldest.Valid {
-			start = time.Unix(int64(oldest.Float64), 0).UTC()
+			start = time.Unix(oldest.Int64, 0).UTC()
 		}
 	}
 	if start.After(now) {
 		start = now.Add(-time.Hour)
 	}
-	where += ` AND julianday(r.time)<=julianday(?)`
+	// A record is included when its whole second is not after "now", which keeps
+	// rows written in the current second visible.
+	where += ` AND r.time_unix<=CAST(strftime('%s',?) AS INTEGER)`
 	args = append(append([]any{}, args...), now.Format(time.RFC3339Nano))
 	stats := performanceStats{Start: start.Format(time.RFC3339Nano), End: now.Format(time.RFC3339Nano), BucketSeconds: chartBucket(now.Sub(start).Seconds()), Series: []performancePoint{}}
-	if r.URL.Query().Get("since") != "" {
+	if bounded {
 		// Tell the browser when a record next leaves the moving window. Include
 		// every matching request, since errors and model-list calls affect totals
 		// even though they do not contribute to inference distributions.
 		var oldest string
-		e = tx.QueryRowContext(ctx, `SELECT r.time FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY julianday(r.time),r.time LIMIT 1`, args...).Scan(&oldest)
+		e = tx.QueryRowContext(ctx, `SELECT r.time FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE `+where+` ORDER BY r.time_unix,r.id LIMIT 1`, args...).Scan(&oldest)
 		if e != nil && e != sql.ErrNoRows {
 			fail(w, 500, "database error")
 			return
@@ -145,18 +169,21 @@ func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, 
 			stats.ExpiresAt = &expires
 		}
 	}
-	stats.Latency, e = distributionFor(ctx, tx, where, args, `r.duration_ms/1000.0`, []float64{0, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300})
+	if e = buildWindow(ctx, tx, where, args, stats.BucketSeconds); e != nil {
+		fail(w, 500, "database error")
+		return
+	}
+	stats.Latency, e = distributionFor(ctx, tx, "duration", []float64{0, .1, .25, .5, 1, 2, 5, 10, 30, 60, 120, 300})
 	if e != nil {
 		fail(w, 500, "database error")
 		return
 	}
-	stats.OutputRate, e = distributionFor(ctx, tx, where, args, rateSQL, []float64{0, 1, 2, 5, 10, 20, 40, 80, 160, 320})
+	stats.OutputRate, e = distributionFor(ctx, tx, "rate", []float64{0, 1, 2, 5, 10, 20, 40, 80, 160, 320})
 	if e != nil {
 		fail(w, 500, "database error")
 		return
 	}
-	query := fmt.Sprintf(`SELECT (unixepoch(r.time)/%d)*%d AS bucket,count(*),coalesce(sum(r.input_tokens),0),coalesce(sum(r.output_tokens),0),avg(%s),count(%s) FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE %s GROUP BY bucket ORDER BY bucket`, stats.BucketSeconds, stats.BucketSeconds, rateSQL, rateSQL, where)
-	rows, e := tx.QueryContext(ctx, query, args...)
+	rows, e := tx.QueryContext(ctx, `SELECT bucket,count(*),coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),avg(rate),count(rate) FROM `+windowTable+` GROUP BY bucket ORDER BY bucket`)
 	if e != nil {
 		fail(w, 500, "database error")
 		return
@@ -183,4 +210,42 @@ func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, 
 		return
 	}
 	reply(w, 200, stats)
+}
+
+// timeseries returns bucketed totals for the selected window. Bucket width uses
+// the same rule as the charts so the response stays bounded for long windows,
+// and the window itself follows the same ?since contract as every other
+// reporting route instead of an implicit fixed hour.
+func (a *App) timeseries(w http.ResponseWriter, since string, where string, args []any) {
+	now := time.Now().UTC()
+	start := now.Add(-time.Hour)
+	if since == "" {
+		where += ` AND r.time_unix>=?`
+		args = append(append([]any{}, args...), start.Unix())
+	} else if parsed, e := time.Parse(time.RFC3339Nano, since); e == nil && !parsed.After(now) {
+		start = parsed.UTC()
+	}
+	bucket := chartBucket(now.Sub(start).Seconds())
+	query := fmt.Sprintf(`SELECT (r.time_unix/%d)*%d AS stamp,count(*) AS requests,coalesce(sum(r.input_tokens),0) AS input_tokens,coalesce(sum(r.output_tokens),0) AS output_tokens,round(avg(r.duration_ms)) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE %s GROUP BY stamp ORDER BY stamp`, bucket, bucket, where)
+	rows, e := a.db.Query(query, args...)
+	if e != nil {
+		fail(w, 500, "database error")
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var stamp int64
+		var requests, input, output, avg int64
+		if rows.Scan(&stamp, &requests, &input, &output, &avg) != nil {
+			fail(w, 500, "database error")
+			return
+		}
+		out = append(out, map[string]any{"time": time.Unix(stamp, 0).UTC().Format(time.RFC3339), "requests": requests, "input_tokens": input, "output_tokens": output, "avg_ms": avg})
+	}
+	if rows.Err() != nil {
+		fail(w, 500, "database error")
+		return
+	}
+	reply(w, 200, out)
 }

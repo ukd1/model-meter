@@ -264,8 +264,8 @@ func TestAnonymousStreamingErrorsAndBoundedLogging(t *testing.T) {
 		t.Fatalf("anonymous errors not logged: %d %v", unmeteredErrors, err)
 	}
 	a.stopLogger()
-	a.records = make(chan []any, 1)
-	a.records <- nil
+	a.records = make(chan requestRecord, 1)
+	a.records <- requestRecord{}
 	started := time.Now()
 	res := anonymousCall(t, s, "GET", "/v1/models", "", nil)
 	io.Copy(io.Discard, res.Body)
