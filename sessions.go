@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -120,7 +122,7 @@ func (a *App) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, "same-origin dashboard request required")
 		return
 	}
-	if r.Header.Get("Content-Type") != "application/json" {
+	if !JSONContentType(r) {
 		fail(w, 415, "application/json required")
 		return
 	}
@@ -142,16 +144,28 @@ func (a *App) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var credentialHash string
-	err := a.db.QueryRowContext(r.Context(), `SELECT password_hash FROM users WHERE username=? AND disabled=0`, normalizeUsername(v.Username)).Scan(&credentialHash)
+	account := normalizeUsername(v.Username)
+	peer, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if retry, limited := a.login.blocked("u:"+account, "p:"+peer); limited {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		fail(w, 429, "too many sign-in attempts; wait and try again")
+		return
+	}
+	err := a.db.QueryRowContext(r.Context(), `SELECT password_hash FROM users WHERE username=? AND disabled=0`, account).Scan(&credentialHash)
 	if err != nil || !verifyPassword(v.Password, credentialHash) {
+		a.login.fail("u:"+account, "p:"+peer)
 		fail(w, 401, "username or password incorrect")
 		return
 	}
 	p, err := a.credentialIdentity(r.Context(), credentialHash)
 	if err != nil {
+		a.login.fail("u:"+account, "p:"+peer)
 		fail(w, 401, "username or password incorrect")
 		return
 	}
+	// A valid password clears only the per-account counter; the per-peer budget
+	// stays spent so one working account cannot reset a spraying attempt.
+	a.login.succeed("u:" + account)
 	value := token()
 	expires := time.Now().Add(sessionLifetime)
 	if _, err = a.db.ExecContext(r.Context(), `INSERT INTO sessions(hash,credential_hash,expires) VALUES(?,?,?)`, hash(value), credentialHash, expires.Unix()); err != nil {
