@@ -27,6 +27,9 @@ const (
 	defaultLoginWindow = 15 * time.Minute
 	defaultLoginUser   = 8
 	defaultLoginPeer   = 30
+	// Entries above this count are pruned of expired windows. Live entries are
+	// bounded by distinct accounts and peers seen inside one window.
+	loginPruneAt = 4096
 )
 
 type loginTally struct {
@@ -56,45 +59,54 @@ func (l *loginLimiter) limitFor(key string) int {
 	return defaultLoginUser
 }
 
-// blocked reports whether either key is over its limit, and how long the caller
-// should wait before retrying.
-func (l *loginLimiter) blocked(keys ...string) (time.Duration, bool) {
+// begin checks both budgets and, when the attempt is allowed, records it in the
+// same critical section. Recording before the password is verified means a
+// concurrent burst cannot slip an unbounded number of extra verifications past
+// the limit, which a check-then-act sequence would allow.
+func (l *loginLimiter) begin(account, peer string) (time.Duration, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
 	window := l.window()
+	keys := make([]string, 0, 2)
+	if account != "" {
+		keys = append(keys, account)
+	}
+	// An unknown peer (for example a unix socket or a bare relay) is not shared
+	// with other clients, so it must not collapse into one common bucket.
+	if peer != "" {
+		keys = append(keys, peer)
+	}
 	retry := time.Duration(0)
-	limited := false
 	for _, key := range keys {
 		tally, ok := l.entries[key]
 		if !ok {
 			continue
 		}
-		if age := now.Sub(tally.first); age >= window {
+		age := now.Sub(tally.first)
+		if age >= window {
 			delete(l.entries, key)
 			continue
 		}
 		if tally.count >= l.limitFor(key) {
-			if wait := window - now.Sub(tally.first); wait > retry {
+			if wait := window - age; wait > retry {
 				retry = wait
 			}
-			limited = true
 		}
 	}
-	return retry, limited
+	if retry > 0 {
+		return retry, true
+	}
+	l.record(now, window, keys)
+	return 0, false
 }
 
-// fail records a rejected attempt. Expired windows restart, and the map is
-// pruned when it grows so a flood of distinct usernames cannot grow it forever.
-func (l *loginLimiter) fail(keys ...string) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	now := time.Now()
-	window := l.window()
+// record charges an allowed attempt to every key. The caller holds the lock.
+func (l *loginLimiter) record(now time.Time, window time.Duration, keys []string) {
 	if l.entries == nil {
 		l.entries = make(map[string]*loginTally)
 	}
-	if len(l.entries) > 4096 {
+	if len(l.entries) > loginPruneAt {
 		for key, tally := range l.entries {
 			if now.Sub(tally.first) >= window {
 				delete(l.entries, key)
@@ -102,9 +114,6 @@ func (l *loginLimiter) fail(keys ...string) {
 		}
 	}
 	for _, key := range keys {
-		if key == "" {
-			continue
-		}
 		tally, ok := l.entries[key]
 		if !ok || now.Sub(tally.first) >= window {
 			l.entries[key] = &loginTally{count: 1, first: now}
@@ -114,13 +123,21 @@ func (l *loginLimiter) fail(keys ...string) {
 	}
 }
 
-// succeed clears the account counter so one legitimate sign-in is not punished
-// by earlier typos. The peer counter is deliberately kept: clearing it would let
-// an attacker reset their budget whenever they control one valid account.
-func (l *loginLimiter) succeed(keys ...string) {
+// succeed clears the account budget and refunds the peer charge, so ordinary
+// successful sign-ins do not consume the shared per-peer allowance while a
+// genuinely failing peer still spends it. Clearing the peer counter outright
+// would let an attacker reset their budget whenever they control one account.
+func (l *loginLimiter) succeed(account, peer string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, key := range keys {
-		delete(l.entries, key)
+	if account != "" {
+		delete(l.entries, account)
+	}
+	if tally, ok := l.entries[peer]; ok {
+		if tally.count <= 1 {
+			delete(l.entries, peer)
+		} else {
+			tally.count--
+		}
 	}
 }

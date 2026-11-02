@@ -791,17 +791,18 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 		// Decode only the routing fields first. The body is re-encoded only when a
 		// model alias or stream_options injection requires it, which keeps the
 		// common path to a single copy of the request instead of three.
-		var meta struct {
-			Model  json.RawMessage `json:"model"`
-			Stream json.RawMessage `json:"stream"`
-		}
-		if trimmed := bytes.TrimLeft(body, " \t\r\n"); len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(body, &meta) != nil {
+		//
+		// Keys are matched exactly: decoding into a struct would accept "MODEL",
+		// check that value against the key's allowlist, and then forward a body that
+		// never set "model" at all, letting the upstream pick its own default.
+		var meta map[string]json.RawMessage
+		if json.Unmarshal(body, &meta) != nil || meta == nil {
 			status = 400
 			outcome = "rejected"
 			fail(w, status, "JSON object required")
 			return
 		}
-		json.Unmarshal(meta.Model, &m.Model)
+		json.Unmarshal(meta["model"], &m.Model)
 		if !allowedValue(allowedModels, m.Model) {
 			status, outcome = 403, "rejected"
 			fail(w, status, "model not permitted for this key")
@@ -809,7 +810,7 @@ func (a *App) proxy(w http.ResponseWriter, r *http.Request) {
 		}
 		mapped, alias := a.modelAliases[m.Model]
 		var stream bool
-		json.Unmarshal(meta.Stream, &stream)
+		json.Unmarshal(meta["stream"], &stream)
 		injectUsage := stream && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/completions")
 		if alias || injectUsage {
 			var obj map[string]json.RawMessage
@@ -936,6 +937,9 @@ func main() {
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 3 * time.Minute,
+		// A custom DialContext disables automatic HTTP/2, which the default
+		// transport had enabled for HTTPS upstreams.
+		ForceAttemptHTTP2:     true,
 		ExpectContinueTimeout: time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConns:          100,

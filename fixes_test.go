@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -58,24 +59,14 @@ func TestJSONMediaTypeParametersAccepted(t *testing.T) {
 }
 
 // Bootstrap recovery only runs at startup, so losing every administrator would
-// lock operators out until they can edit the database by hand.
+// lock operators out until they can edit the database by hand. The fixture
+// administrator has id 0, which /admin/users/update refuses before the guard can
+// run, so the guard is exercised through a positive-id account instead.
 func TestLastAdministratorCannotBeRemoved(t *testing.T) {
 	a, s, _ := fixture(t, emptyUpstream)
-	for _, body := range []string{`{"ID":0,"Admin":false}`, `{"ID":0,"Disabled":true}`} {
-		res := call(t, s, "/admin/users/update", "admin-secret", body)
-		if res.StatusCode != http.StatusBadRequest {
-			t.Fatalf("%s: last administrator removal returned %d", body, res.StatusCode)
-		}
-	}
-	var admin, disabled int
-	if err := a.db.QueryRow(`SELECT admin,disabled FROM users WHERE id=0`).Scan(&admin, &disabled); err != nil {
+	if _, err := a.db.Exec(`UPDATE users SET admin=0 WHERE id=0`); err != nil {
 		t.Fatal(err)
 	}
-	if admin != 1 || disabled != 0 {
-		t.Fatalf("rejected update still applied: admin=%d disabled=%d", admin, disabled)
-	}
-	// A second administrator may be demoted while one usable account remains.
-	var id int64
 	encoded, err := passwordHash("bob-secret")
 	if err != nil {
 		t.Fatal(err)
@@ -84,11 +75,43 @@ func TestLastAdministratorCannotBeRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id, err = res.LastInsertId()
-	if err != nil {
+	id, err := res.LastInsertId()
+	if err != nil || id <= 0 {
+		t.Fatalf("bob id=%d %v", id, err)
+	}
+	// Bob is now the only usable administrator. Both refusals must come from the
+	// guard itself, so the message is asserted too: the id validation path also
+	// answers 400, and a test that only checked the status would pass without the
+	// guard ever running.
+	for _, body := range []string{fmt.Sprintf(`{"ID":%d,"Admin":false}`, id), fmt.Sprintf(`{"ID":%d,"Disabled":true}`, id)} {
+		res := call(t, s, "/admin/users/update", "bob:bob-secret", body)
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s: last administrator removal returned %d", body, res.StatusCode)
+		}
+		var got struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Error.Message != "at least one active administrator is required" {
+			t.Fatalf("%s: rejected by %q instead of the administrator guard", body, got.Error.Message)
+		}
+	}
+	var admin, disabled int
+	if err := a.db.QueryRow(`SELECT admin,disabled FROM users WHERE id=?`, id).Scan(&admin, &disabled); err != nil {
 		t.Fatal(err)
 	}
-	if res := call(t, s, "/admin/users/update", "admin-secret", fmt.Sprintf(`{"ID":%d,"Admin":false}`, id)); res.StatusCode != http.StatusOK {
+	if admin != 1 || disabled != 0 {
+		t.Fatalf("rejected update still applied: admin=%d disabled=%d", admin, disabled)
+	}
+	// A second usable administrator makes the same demotion legal.
+	if _, err := a.db.Exec(`UPDATE users SET admin=1 WHERE id=0`); err != nil {
+		t.Fatal(err)
+	}
+	if res := call(t, s, "/admin/users/update", "bob:bob-secret", fmt.Sprintf(`{"ID":%d,"Admin":false}`, id)); res.StatusCode != http.StatusOK {
 		t.Fatalf("demoting one of two administrators returned %d", res.StatusCode)
 	}
 }
@@ -147,8 +170,9 @@ func TestRequestTimeIsNormalisedToEpoch(t *testing.T) {
 	}
 }
 
-// A ?since window must be applied by the stored epoch column, not by rebuilding
-// a julian day for every row.
+// The window predicate now reads a stored epoch column, but membership must
+// still match a julian-day comparison; TestRequestTimeIsNormalisedToEpoch covers
+// the column itself.
 func TestPerformanceWindowExcludesOlderRequests(t *testing.T) {
 	a, s, _ := fixture(t, emptyUpstream)
 	now := time.Now().UTC()
@@ -197,6 +221,69 @@ func TestTimeseriesHonoursSince(t *testing.T) {
 	}
 }
 
+// round() yields REAL, and a value at or above a million milliseconds reaches
+// database/sql as "1.5e+06", which cannot be scanned into an int64. One long
+// agent turn must not break the whole chart response.
+func TestTimeseriesHandlesLongDurations(t *testing.T) {
+	a, s, _ := fixture(t, emptyUpstream)
+	insertTestRequestMS(t, a, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), "/v1/chat/completions", 1500000)
+	res := call(t, s, "/admin/timeseries", "admin-secret", "")
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("long duration chart returned %d", res.StatusCode)
+	}
+	var rows []struct {
+		AvgMS int64 `json:"avg_ms"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.AvgMS == 1500000 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("avg_ms=1500000 missing from %+v", rows)
+	}
+}
+
+// Every reporting route shares one ?since contract, including rejecting values
+// that /admin/performance rejects instead of silently charting an empty window.
+func TestTimeseriesRejectsInvalidSince(t *testing.T) {
+	_, s, _ := fixture(t, emptyUpstream)
+	for _, since := range []string{"not-a-time", time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)} {
+		if res := call(t, s, "/admin/timeseries?since="+url.QueryEscape(since), "admin-secret", ""); res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("since=%q returned %d", since, res.StatusCode)
+		}
+	}
+}
+
+// encoding/json matches struct fields to keys case-insensitively, so decoding the
+// routing fields into a struct let {"MODEL":"allowed"} satisfy the allowlist
+// while the forwarded body never set "model", leaving the upstream free to pick
+// its own default model.
+func TestModelAllowlistRequiresExactModelKey(t *testing.T) {
+	var calls atomic.Int32
+	a, s, key := fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	})
+	if _, e := a.db.Exec(`UPDATE keys SET allowed_models='["allowed-model"]' WHERE hash=?`, hash(key)); e != nil {
+		t.Fatal(e)
+	}
+	if res := call(t, s, "/v1/chat/completions", key, `{"MODEL":"allowed-model"}`); res.StatusCode != http.StatusForbidden {
+		t.Fatalf("case-variant model key returned %d", res.StatusCode)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("case-variant model key reached upstream")
+	}
+	if res := call(t, s, "/v1/chat/completions", key, `{"model":"allowed-model"}`); res.StatusCode != http.StatusOK {
+		t.Fatalf("permitted model returned %d", res.StatusCode)
+	}
+}
+
 func timeseriesTotal(t *testing.T, res *http.Response) int64 {
 	t.Helper()
 	if res.StatusCode != http.StatusOK {
@@ -217,10 +304,41 @@ func timeseriesTotal(t *testing.T, res *http.Response) int64 {
 
 func insertTestRequest(t *testing.T, a *App, stamp, path string) {
 	t.Helper()
-	_, err := a.db.Exec(`INSERT INTO requests(key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome) VALUES(NULL,?,'m','POST',?,'127.0.0.1',200,500,10,20,0,'complete')`, stamp, path)
+	insertTestRequestMS(t, a, stamp, path, 500)
+}
+
+func insertTestRequestMS(t *testing.T, a *App, stamp, path string, durationMS int64) {
+	t.Helper()
+	_, err := a.db.Exec(`INSERT INTO requests(key_id,time,model,method,path,source,status,duration_ms,input_tokens,output_tokens,cached_tokens,outcome) VALUES(NULL,?,'m','POST',?,'127.0.0.1',200,?,10,20,0,'complete')`, stamp, path, durationMS)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
 var _ = httptest.NewServer
+
+// A reverse proxy makes every browser share the loopback address, so a loopback
+// peer is trusted to report the client. Any other peer must not be able to move
+// itself between budgets by sending the header.
+func TestLoginPeerKeyTrustsForwardedAddressOnlyFromLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		remote, forwarded, want string
+	}{
+		{"203.0.113.9:5555", "198.51.100.7", "p:203.0.113.9"},
+		{"203.0.113.9:5555", "", "p:203.0.113.9"},
+		{"127.0.0.1:5555", "198.51.100.7", "p:198.51.100.7"},
+		{"127.0.0.1:5555", " 198.51.100.7 , 10.0.0.1", "p:198.51.100.7"},
+		{"127.0.0.1:5555", "", "p:127.0.0.1"},
+		{"[::1]:5555", "198.51.100.7", "p:198.51.100.7"},
+		{"not-an-address", "198.51.100.7", ""},
+	} {
+		r := httptest.NewRequest("POST", "/auth/login", nil)
+		r.RemoteAddr = tc.remote
+		if tc.forwarded != "" {
+			r.Header.Set("X-Forwarded-For", tc.forwarded)
+		}
+		if got := loginPeerKey(r); got != tc.want {
+			t.Fatalf("remote=%q forwarded=%q got %q want %q", tc.remote, tc.forwarded, got, tc.want)
+		}
+	}
+}

@@ -302,6 +302,16 @@ func TestAnonymousMigrationPreservesHistoryAndIndexes(t *testing.T) {
 	if err := db.QueryRow(`SELECT r.id,r.key_id,k.user_id,r.cached_tokens,r.model FROM requests r JOIN keys k ON k.id=r.key_id`).Scan(&id, &keyID, &owner, &cached, &model); err != nil || id != 99 || keyID != 42 || owner != 7 || cached != 9 || model != "old-model" {
 		t.Fatalf("migration lost existing history: %d %d %d %d %s %v", id, keyID, owner, cached, model, err)
 	}
+	// A rebuild that left time_unix unset would silently drop all history from
+	// every chart, so assert the derived epoch value survives the migration.
+	legacy, e := time.Parse("2006-01-02", "2026-01-01")
+	if e != nil {
+		t.Fatal(e)
+	}
+	var migratedUnix int64
+	if err := db.QueryRow(`SELECT time_unix FROM requests WHERE id=99`).Scan(&migratedUnix); err != nil || migratedUnix != legacy.Unix() {
+		t.Fatalf("migration left time_unix unset: %d want %d %v", migratedUnix, legacy.Unix(), err)
+	}
 	for _, index := range []string{"custom_requests_model", "requests_time", "requests_key"} {
 		var count int
 		if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&count); err != nil || count != 1 {

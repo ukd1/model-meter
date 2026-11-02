@@ -105,17 +105,27 @@ func chartBucket(span float64) int64 {
 	}
 	return int64(math.Ceil(span/120/86400)) * 86400
 }
+
+// windowStart resolves a ?since value. An absent value means the last hour; an
+// unparseable or future value is rejected so every reporting route agrees.
+func windowStart(since string, now time.Time) (time.Time, bool) {
+	if since == "" {
+		return now.Add(-time.Hour), true
+	}
+	parsed, e := time.Parse(time.RFC3339Nano, since)
+	if e != nil || parsed.After(now) {
+		return time.Time{}, false
+	}
+	return parsed.UTC(), true
+}
 func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, args []any) {
 	now := time.Now().UTC()
-	start := now.Add(-time.Hour)
-	bounded := r.URL.Query().Get("since") != ""
-	if bounded {
-		parsed, e := time.Parse(time.RFC3339Nano, r.URL.Query().Get("since"))
-		if e != nil || parsed.After(now) {
-			fail(w, 400, "since must be a past RFC3339 timestamp")
-			return
-		}
-		start = parsed.UTC()
+	sinceArg := r.URL.Query().Get("since")
+	bounded := sinceArg != ""
+	start, ok := windowStart(sinceArg, now)
+	if !ok {
+		fail(w, 400, "since must be a past RFC3339 timestamp")
+		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
@@ -218,15 +228,19 @@ func (a *App) performance(w http.ResponseWriter, r *http.Request, where string, 
 // reporting route instead of an implicit fixed hour.
 func (a *App) timeseries(w http.ResponseWriter, since string, where string, args []any) {
 	now := time.Now().UTC()
-	start := now.Add(-time.Hour)
+	start, ok := windowStart(since, now)
+	if !ok {
+		fail(w, 400, "since must be a past RFC3339 timestamp")
+		return
+	}
 	if since == "" {
 		where += ` AND r.time_unix>=?`
 		args = append(append([]any{}, args...), start.Unix())
-	} else if parsed, e := time.Parse(time.RFC3339Nano, since); e == nil && !parsed.After(now) {
-		start = parsed.UTC()
 	}
 	bucket := chartBucket(now.Sub(start).Seconds())
-	query := fmt.Sprintf(`SELECT (r.time_unix/%d)*%d AS stamp,count(*) AS requests,coalesce(sum(r.input_tokens),0) AS input_tokens,coalesce(sum(r.output_tokens),0) AS output_tokens,round(avg(r.duration_ms)) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE %s GROUP BY stamp ORDER BY stamp`, bucket, bucket, where)
+	// round() yields REAL, and database/sql cannot convert a value like "1.5e+06"
+	// into an int64, so cast inside SQL instead of scanning a float.
+	query := fmt.Sprintf(`SELECT (r.time_unix/%d)*%d AS stamp,count(*) AS requests,coalesce(sum(r.input_tokens),0) AS input_tokens,coalesce(sum(r.output_tokens),0) AS output_tokens,CAST(coalesce(round(avg(r.duration_ms)),0) AS INTEGER) AS avg_ms FROM requests r LEFT JOIN keys k ON k.id=r.key_id WHERE %s GROUP BY stamp ORDER BY stamp`, bucket, bucket, where)
 	rows, e := a.db.Query(query, args...)
 	if e != nil {
 		fail(w, 500, "database error")
