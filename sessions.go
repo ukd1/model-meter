@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -106,6 +108,26 @@ func (a *App) deleteSession(r *http.Request) error {
 	return nil
 }
 
+// loginPeerKey namespaces the client address used for the per-peer sign-in
+// budget. The TCP peer is authoritative, but a reverse proxy in front of this
+// service would make every browser share one address, so a loopback peer is
+// trusted to report the real client through X-Forwarded-For. A direct client
+// cannot reach this branch by spoofing the header, and even if it did it would
+// only shuffle its own peer budget; the per-account limit is unaffected.
+func loginPeerKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		forwarded, _, _ := strings.Cut(r.Header.Get("X-Forwarded-For"), ",")
+		if client := strings.TrimSpace(forwarded); client != "" {
+			host = client
+		}
+	}
+	return "p:" + host
+}
+
 func (a *App) sessionAPI(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/auth/login" && r.URL.Path != "/auth/logout" {
 		http.NotFound(w, r)
@@ -120,7 +142,7 @@ func (a *App) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, "same-origin dashboard request required")
 		return
 	}
-	if r.Header.Get("Content-Type") != "application/json" {
+	if !JSONContentType(r) {
 		fail(w, 415, "application/json required")
 		return
 	}
@@ -142,7 +164,17 @@ func (a *App) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var credentialHash string
-	err := a.db.QueryRowContext(r.Context(), `SELECT password_hash FROM users WHERE username=? AND disabled=0`, normalizeUsername(v.Username)).Scan(&credentialHash)
+	account := normalizeUsername(v.Username)
+	accountKey := "u:" + account
+	peerKey := loginPeerKey(r)
+	// begin records the attempt atomically, so a concurrent burst cannot buy
+	// extra password checks beyond the budget.
+	if retry, limited := a.login.begin(accountKey, peerKey); limited {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+		fail(w, 429, "too many sign-in attempts; wait and try again")
+		return
+	}
+	err := a.db.QueryRowContext(r.Context(), `SELECT password_hash FROM users WHERE username=? AND disabled=0`, account).Scan(&credentialHash)
 	if err != nil || !verifyPassword(v.Password, credentialHash) {
 		fail(w, 401, "username or password incorrect")
 		return
@@ -152,6 +184,9 @@ func (a *App) sessionAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 401, "username or password incorrect")
 		return
 	}
+	// A valid password refunds its peer charge but never the failures that came
+	// before it, so one working account cannot reset a spraying budget.
+	a.login.succeed(accountKey, peerKey)
 	value := token()
 	expires := time.Now().Add(sessionLifetime)
 	if _, err = a.db.ExecContext(r.Context(), `INSERT INTO sessions(hash,credential_hash,expires) VALUES(?,?,?)`, hash(value), credentialHash, expires.Unix()); err != nil {
