@@ -1,7 +1,7 @@
 GO      ?= go
 BINARY  ?= model-meter
 
-.PHONY: all build test race vet vuln check clean
+.PHONY: all build test race vet vuln fmt check clean
 
 all: check build
 
@@ -19,12 +19,16 @@ race:
 vet:
 	$(GO) vet ./...
 
+# Reported rather than rewritten, so a local run and CI agree on the result.
+fmt:
+	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
+
 # Built with the current toolchain rather than a preinstalled binary, so the
 # standard library is analysed against the Go version this project targets.
 vuln:
 	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
-check: vet test
+check: vet fmt test
 
 clean:
 	rm -f $(BINARY)

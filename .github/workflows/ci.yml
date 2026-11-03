@@ -19,6 +19,14 @@ jobs:
           cache: true
       - name: Verify dependencies
         run: go mod verify
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"
+            echo "$unformatted"
+            exit 1
+          fi
       - name: Vet
         run: go vet ./...
       # cgo and a C compiler are required by the SQLite driver; the runner
