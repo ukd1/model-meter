@@ -166,8 +166,8 @@ func TestMissingUsageAndError(t *testing.T) {
 func TestFullLogQueueDoesNotBlock(t *testing.T) {
 	a, s, key := fixture(t, func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{}`) })
 	a.stopLogger()
-	a.records = make(chan []any, 1)
-	a.records <- nil
+	a.records = make(chan requestRecord, 1)
+	a.records <- requestRecord{}
 	start := time.Now()
 	res := call(t, s, "/v1/models", key, "")
 	io.Copy(io.Discard, res.Body)
